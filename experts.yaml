@@ -1,0 +1,14 @@
+experts:
+  - id: codex-fast-0
+    driver: codex
+    command: codex exec --skip-git-repo-check --sandbox workspace-write
+    prompt_variant: direct
+  - id: claude-deep-0
+    driver: claude
+    command: claude -p
+    prompt_variant: tests-first
+  - id: opencode-review-0
+    driver: opencode
+    command: opencode run
+    prompt_variant: adversarial-review
+

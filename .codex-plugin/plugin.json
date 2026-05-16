@@ -1,0 +1,16 @@
+{
+  "name": "rsi-harness",
+  "version": "0.1.0",
+  "description": "Recursive self-improvement coding harness for Codex, Claude Code, and OpenCode.",
+  "skills": "./skills",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "RSI Harness",
+    "shortDescription": "Candidate generation, verification, feedback, and selection for coding agents.",
+    "developerName": "Local",
+    "category": "engineering",
+    "capabilities": ["coding", "verification", "automation"]
+  }
+}
+

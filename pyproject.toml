@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rsi-harness"
+version = "0.1.0"
+description = "Recursive self-improvement coding harness for CLI coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+rsi = "rsi_harness.cli:main"
+
+[tool.setuptools]
+packages = ["rsi_harness"]
+

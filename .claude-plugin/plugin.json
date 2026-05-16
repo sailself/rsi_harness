@@ -1,0 +1,8 @@
+{
+  "name": "rsi-harness",
+  "version": "0.1.0",
+  "description": "Recursive self-improvement coding harness for Codex, Claude Code, and OpenCode.",
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json"
+}
+

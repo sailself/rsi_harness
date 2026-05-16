@@ -1,0 +1,15 @@
+{
+  "mcp_servers": {
+    "rsi-harness": {
+      "command": "python",
+      "args": ["-m", "rsi_harness.mcp_server"]
+    }
+  },
+  "mcpServers": {
+    "rsi-harness": {
+      "command": "python",
+      "args": ["-m", "rsi_harness.mcp_server"]
+    }
+  }
+}
+

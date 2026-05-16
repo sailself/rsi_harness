@@ -1,0 +1,18 @@
+verify:
+  timeout_sec: 180
+  memory_mb: 4096
+  commands:
+    - name: unit
+      run: python -m unittest discover -s tests
+  changed_file_rules:
+    "rsi_harness/**/*.py": ["python -m unittest discover -s tests"]
+    "tests/**/*.py": ["python -m unittest discover -s tests"]
+
+search:
+  experts: 3
+  rounds: 2
+  worktree: false
+  selector: behavioral_vote
+  feedback_budget_chars: 12000
+  experts_file: experts.yaml
+
