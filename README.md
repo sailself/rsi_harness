@@ -1,99 +1,394 @@
 # RSI Harness
 
-`rsi-harness` is a small, standard-library Python harness for improving coding-agent output quality through external verification loops. It is designed to work with Codex, Claude Code, and OpenCode without fine-tuning or model-internal access.
+`rsi-harness` is a small Python harness for improving coding-agent output with an
+external verification loop. It does not fine-tune a model or inspect model
+internals. Instead, it asks one or more CLI coding agents to produce candidate
+patches, runs configured checks, records the evidence, and selects the best
+candidate by executable results.
 
-## Design Principles
+The project is designed to be usable from:
 
-The Poetiq article describes a meta-system that improves coding results by constructing and optimizing an external harness around standard LLM APIs, accounting for correctness, runtime, and memory constraints, and reusing the learned harness across models. This project implements the transferable part of that idea:
+- Codex, through the bundled plugin manifest, skill, hooks, and MCP server.
+- Claude Code, through the bundled plugin manifest, skill, hooks, and MCP server.
+- OpenCode, through `AGENTS.md` instructions and direct `rsi` CLI usage.
+- Plain shell scripts or CI jobs, through `python -m rsi_harness.cli` or the
+  installed `rsi` command.
 
-- Keep generation in the agent, but move judgment into a harness.
-- Store every candidate as a diff, prompt, command log, and verification report.
-- Prefer hard executable gates over model self-assessment.
-- Use compact failing evidence as the next repair prompt.
-- Select winners by hard pass first, then test pass rate, behavioral vote count, quality, risk, runtime, and patch size.
-- Keep the same core usable from Codex hooks, Claude hooks, OpenCode prompts, batch mode, or MCP.
+## What It Does
 
-Reference points checked while building this scaffold:
+The harness wraps the parts of recursive self-improvement that are practical for
+normal coding-agent workflows:
 
-- Poetiq RSI article: https://poetiq.ai/posts/recursive_self_improvement_coding/
-- Codex hooks/plugins/skills docs: https://developers.openai.com/codex/hooks, https://developers.openai.com/codex/plugins/build, https://developers.openai.com/codex/skills
-- Claude Code hooks/plugins/skills docs: https://code.claude.com/docs/en/hooks, https://code.claude.com/docs/en/plugins, https://code.claude.com/docs/en/skills
-- OpenCode CLI docs: https://open-code.ai/en/docs/cli
+1. Capture the task as a measurable spec.
+2. Generate one or more candidate patches with external agent CLIs.
+3. Run hard verification commands such as tests, lint, typecheck, or benchmarks.
+4. Compact failing command output into feedback for the next round.
+5. Persist prompts, patches, agent logs, verification reports, and selection data.
+6. Pick a winner by hard pass first, then test pass rate, vote count, quality,
+   risk, runtime, and patch size.
 
-## Quick Start
+The important separation is that agents generate code, while the harness records
+and judges the result. That keeps the workflow model-agnostic and makes the
+evidence inspectable after the run.
 
-Run the local checks:
+## When To Use It
 
-```sh
-python -m unittest discover -s tests -v
-python -m rsi_harness.cli verify --json
-```
-
-Create starter config in another project:
-
-```sh
-python -m rsi_harness.cli init
-```
-
-Run verification from configured `.rsi.yaml`:
+Use the lightweight verifier for ordinary implementation work:
 
 ```sh
 rsi verify --changed --json
 ```
 
-Run batch candidate search:
+Use the full candidate loop when a task benefits from multiple attempts or
+repair rounds:
 
 ```sh
 rsi run --task issue.md --experts experts.yaml --rounds 3
 rsi select --task latest --json
 ```
 
-Use `--dry-run` to validate prompts and state creation without invoking Codex, Claude, or OpenCode:
+Good fits include difficult bugs, risky refactors, algorithm changes,
+performance work, behavior that needs regression tests, and cases where you want
+several agents or prompt variants to compete against the same checks.
+
+## Requirements
+
+- Python 3.10 or newer.
+- No required Python package dependencies.
+- Optional external agent CLIs for candidate search:
+  - `codex`
+  - `claude`
+  - `opencode`
+- A Git worktree when you want changed-file verification or patch capture.
+
+You can run commands from the repository checkout with:
+
+```sh
+python -m rsi_harness.cli --help
+```
+
+After installing the package, the same CLI is available as `rsi`:
+
+```sh
+pip install -e .
+rsi --help
+```
+
+## Quick Start
+
+Run the project checks in this repository:
+
+```sh
+python -m unittest discover -s tests -v
+python -m rsi_harness.cli verify --json
+```
+
+Create starter harness files in another project:
+
+```sh
+rsi init
+```
+
+That writes:
+
+- `.rsi.yaml`, which defines verification and search behavior.
+- `experts.yaml`, which defines the agent CLIs used for candidate generation.
+
+Run verification from `.rsi.yaml`:
+
+```sh
+rsi verify --json
+```
+
+Run affected verification based on changed files:
+
+```sh
+rsi verify --changed --json
+```
+
+Create a task record without running agents:
+
+```sh
+rsi task "Fix the parser so invalid input reports the source span" --json
+```
+
+Run a dry candidate search to validate prompts and state writes without invoking
+Codex, Claude Code, or OpenCode:
 
 ```sh
 rsi run --task issue.md --rounds 1 --dry-run --json
 ```
 
-## Integration Surfaces
+Run a real candidate search:
 
-Codex plugin:
+```sh
+rsi run --task issue.md --experts experts.yaml --rounds 3 --json
+rsi select --task latest --json
+```
+
+## Configuration
+
+`rsi init` creates a starter `.rsi.yaml` similar to this:
+
+```yaml
+verify:
+  timeout_sec: 180
+  memory_mb: 4096
+  commands:
+    - name: unit
+      run: python -m unittest discover -s tests
+  changed_file_rules:
+    "rsi_harness/**/*.py": ["python -m unittest discover -s tests"]
+    "tests/**/*.py": ["python -m unittest discover -s tests"]
+
+search:
+  experts: 3
+  rounds: 2
+  worktree: false
+  selector: behavioral_vote
+  feedback_budget_chars: 12000
+  experts_file: experts.yaml
+```
+
+Important fields:
+
+- `verify.timeout_sec`: default timeout for each verification command.
+- `verify.commands`: full verification commands used by `rsi verify` and
+  candidate scoring.
+- `verify.changed_file_rules`: file-pattern-specific commands used by
+  `rsi verify --changed`; if no changed rule matches, the harness falls back to
+  `verify.commands`.
+- `search.experts`: fallback number of Codex experts if `experts.yaml` is
+  missing.
+- `search.rounds`: default number of candidate-generation rounds.
+- `search.feedback_budget_chars`: maximum feedback text carried into the next
+  candidate prompt.
+- `search.experts_file`: default experts file for `rsi run`.
+
+The config loader accepts YAML when PyYAML is installed and otherwise falls back
+to the minimal YAML subset used by the starter config.
+
+## Experts
+
+`experts.yaml` tells the orchestrator which external CLIs can produce
+candidates:
+
+```yaml
+experts:
+  - id: codex-fast-0
+    driver: codex
+    command: codex exec --skip-git-repo-check --sandbox workspace-write
+    prompt_variant: direct
+  - id: claude-deep-0
+    driver: claude
+    command: claude -p
+    prompt_variant: tests-first
+  - id: opencode-review-0
+    driver: opencode
+    command: opencode run
+    prompt_variant: adversarial-review
+```
+
+Supported drivers are `codex`, `claude` or `claude-code`, and `opencode`.
+The command is split into argv form, the generated prompt is appended, and the
+agent runs in the current working directory. If a command contains a `{prompt}`
+argument, that argument is replaced instead of appending the prompt.
+
+## Core Commands
+
+### `rsi init`
+
+Writes starter `.rsi.yaml` and `experts.yaml` files. Existing files are
+preserved unless you pass `--force`.
+
+```sh
+rsi init
+rsi init --force
+```
+
+### `rsi verify`
+
+Runs configured hard gates and exits non-zero if any command fails or times out.
+Use `--json` when another tool should consume the report.
+
+```sh
+rsi verify --json
+rsi verify --changed --json
+rsi verify --config path/to/.rsi.yaml
+```
+
+### `rsi task`
+
+Creates `.rsi/tasks/<task_id>/task.json` from a text spec.
+
+```sh
+rsi task "Refactor the retry loop without changing public behavior" --json
+```
+
+### `rsi run`
+
+Runs batch candidate search. The `--task` value can be a path to a Markdown
+file or literal task text.
+
+```sh
+rsi run --task issue.md --experts experts.yaml --rounds 3 --json
+rsi run --task "Fix flaky timeout test" --dry-run --json
+```
+
+For each expert and round, the orchestrator builds a candidate prompt, invokes
+the driver, captures the current Git diff as the candidate patch when available,
+runs verification, writes a report, and carries compact failure output into the
+next prompt.
+
+### `rsi select`
+
+Reads `selection.json` for a task and prints the selected candidate.
+
+```sh
+rsi select --task latest --json
+rsi select --task T-20260516000000000000-12345678
+```
+
+### `rsi hook`
+
+Runs lifecycle hook behavior used by Codex and Claude Code integrations.
+
+```sh
+rsi hook session-start
+rsi hook prompt-submit
+rsi hook pre-tool
+rsi hook post-tool
+rsi hook stop
+```
+
+Hooks can add session context, create task records for complex prompts, block
+known destructive commands, run changed-file verification after edits, and
+surface the latest failing evidence before the session stops.
+
+## Artifacts
+
+The harness writes inspectable state under `.rsi/`:
+
+```text
+.rsi/
+  tasks/
+    <task_id>/
+      task.json
+      selection.json
+      candidates/
+        <candidate_id>/
+          prompt.md
+          candidate.patch
+          candidate.json
+          agent.json
+          report.json
+      feedback/
+  hook-feedback/
+    latest.json
+```
+
+Useful files:
+
+- `task.json`: original task spec and metadata.
+- `prompt.md`: exact prompt sent to an expert.
+- `candidate.patch`: captured patch text or agent stdout when no Git diff is
+  available.
+- `agent.json`: argv, stdout, stderr, exit code, and dry-run flag when relevant.
+- `report.json`: command results, stdout, stderr, runtime, timeout status, and
+  output hash.
+- `selection.json`: selected winner and candidate count.
+- `hook-feedback/latest.json`: latest verification report from hook execution.
+
+## Integrations
+
+Codex plugin files:
 
 - `.codex-plugin/plugin.json`
 - `skills/rsi-coding/SKILL.md`
 - `hooks/hooks.json`
 - `.mcp.json`
 
-Claude Code plugin:
+Claude Code plugin files:
 
 - `.claude-plugin/plugin.json`
 - `skills/rsi-coding/SKILL.md`
 - `hooks/hooks.json`
 - `.mcp.json`
 
-OpenCode:
+OpenCode uses the project instruction surface:
 
-- `AGENTS.md` tells OpenCode to use the `rsi` CLI.
+- `AGENTS.md` tells OpenCode to use the `rsi` CLI directly.
 - `experts.yaml` includes an `opencode run` expert for batch mode.
 
-## Core Commands
+The MCP server can be launched with:
 
-`rsi verify`
+```sh
+python -m rsi_harness.mcp_server
+```
 
-Runs configured hard gates from `.rsi.yaml`. With `--changed`, it uses `changed_file_rules` when files match.
+It exposes a minimal stdio bridge for creating tasks, running verification, and
+selecting winners.
 
-`rsi task`
+## Selection
 
-Creates `.rsi/tasks/<task_id>/task.json`.
+Candidates are scored with hard verification as the dominant signal:
 
-`rsi run`
+```text
+score =
+  1000 * hard_pass
+  + 80 * test_pass_rate
+  + 40 * generated_test_pass_rate
+  + 30 * behavioral_vote_count
+  + 20 * static_quality_score
+  - 30 * risk_score
+  - 10 * normalized_runtime
+  - 5  * patch_size_penalty
+```
 
-Creates candidates by invoking configured external agent CLIs, captures prompts/logs/diffs, runs verification, compacts feedback, and writes `selection.json`.
+A failing candidate should not beat a passing candidate on style or confidence.
+The current implementation derives these signals from verification results and
+patch size; richer quality and behavioral voting signals can be added on top of
+the persisted artifact corpus.
 
-`rsi hook`
+## Development
 
-Entry point for Codex and Claude lifecycle hooks. It can create tasks from complex prompts, block known destructive commands, run affected verification after tools, and surface failing evidence at stop time.
+Run local tests:
 
-`python -m rsi_harness.mcp_server`
+```sh
+python -m unittest discover -s tests -v
+```
 
-Minimal stdio MCP server exposing `rsi.create_task`, `rsi.run_verify`, and `rsi.select_winner`.
+Run the harness verifier:
 
+```sh
+python -m rsi_harness.cli verify --json
+```
+
+Run the changed-file verifier:
+
+```sh
+rsi verify --changed --json
+```
+
+## Current Limits
+
+This repository is an installable scaffold, not Poetiq's proprietary learned
+meta-system. It does not yet learn new verifier strategies from historical task
+data. Candidate search runs in the current worktree, so use a clean branch or
+inspect the captured patches carefully when running real external agents.
+
+`verify.memory_mb` is currently configuration metadata; verification enforces
+command timeouts but does not impose an operating-system memory limit.
+
+## References
+
+- Poetiq RSI article: https://poetiq.ai/posts/recursive_self_improvement_coding/
+- Codex hooks, plugins, and skills documentation:
+  https://developers.openai.com/codex/hooks,
+  https://developers.openai.com/codex/plugins/build,
+  https://developers.openai.com/codex/skills
+- Claude Code hooks, plugins, and skills documentation:
+  https://code.claude.com/docs/en/hooks,
+  https://code.claude.com/docs/en/plugins,
+  https://code.claude.com/docs/en/skills
+- OpenCode CLI documentation: https://open-code.ai/en/docs/cli
