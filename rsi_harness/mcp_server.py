@@ -17,7 +17,7 @@ _TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 TOOLS = [
     {
-        "name": "rsi.create_task",
+        "name": "rsi_create_task",
         "description": "Create a persistent RSI task.",
         "inputSchema": {
             "type": "object",
@@ -26,12 +26,12 @@ TOOLS = [
         },
     },
     {
-        "name": "rsi.run_verify",
+        "name": "rsi_run_verify",
         "description": "Run configured verification commands and return executable evidence.",
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
-        "name": "rsi.select_winner",
+        "name": "rsi_select_winner",
         "description": "Return the winner recorded for a task.",
         "inputSchema": {
             "type": "object",
@@ -87,14 +87,14 @@ def handle_request(request: dict[str, Any]) -> dict[str, Any]:
 def _call_tool(params: dict[str, Any]) -> dict[str, Any]:
     name = params.get("name")
     args = params.get("arguments") or {}
-    if name == "rsi.create_task":
+    if name == "rsi_create_task":
         task = HarnessState().create_task(str(args["spec"]), {"source": "mcp"})
         return _text(task.path)
-    if name == "rsi.run_verify":
+    if name == "rsi_run_verify":
         config = load_config()
         report = Verifier(timeout_sec=config.verify.timeout_sec).run(commands_from_config(config), Path.cwd())
         return _text(report.to_json())
-    if name == "rsi.select_winner":
+    if name == "rsi_select_winner":
         raw_task_id = args.get("task_id")
         task_id = _validate_task_id(str(raw_task_id)) if raw_task_id else HarnessState().latest_task_id()
         selection = HarnessState().task_dir(task_id) / "selection.json"
