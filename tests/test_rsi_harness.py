@@ -24,7 +24,9 @@ from rsi_harness.orchestrator import (
     ExpertSpec,
     Orchestrator,
     _parse_test_counts,
+    build_candidate_prompt,
     commands_from_config,
+    git_changed_files,
     score_from_report,
 )
 from rsi_harness.selector import CandidateScore, score_candidate, select_winner
@@ -108,6 +110,118 @@ class _AppendingDriver:
         return DriverRun(argv=["fake-agent"], exit_code=0, stdout="", stderr="")
 
 
+class _MarkerDriver:
+    """Fake agent that writes its marker to a tracked-by-cwd file the verifier reads back."""
+
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+
+    def build_argv(self, prompt: str) -> list[str]:
+        return ["fake-agent", self.marker]
+
+    def run(self, prompt: str, cwd: Path) -> DriverRun:
+        (Path(cwd) / "marker.txt").write_text(self.marker, encoding="utf-8")
+        return DriverRun(argv=["fake-agent"], exit_code=0, stdout="", stderr="")
+
+
+class ChangedFileScopingTests(unittest.TestCase):
+    def test_git_changed_files_includes_untracked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _git_init_repo(root)
+            (root / "new_module.py").write_text("x = 1\n", encoding="utf-8")  # untracked
+            self.assertIn("new_module.py", git_changed_files(root))
+
+    def test_git_changed_files_excludes_rsi_state_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _git_init_repo(root)
+            (root / "src.py").write_text("x = 1\n", encoding="utf-8")
+            (root / ".rsi" / "tasks").mkdir(parents=True)
+            (root / ".rsi" / "tasks" / "t.json").write_text("{}", encoding="utf-8")
+            files = git_changed_files(root)
+            self.assertIn("src.py", files)
+            self.assertFalse(any(f.startswith(".rsi/") for f in files), files)
+
+    def test_changed_only_routes_search_through_changed_file_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _git_init_repo(root)
+            rule_cmd = f'"{sys.executable}" -c "print(\'RULE\')"'
+            full_cmd = f'"{sys.executable}" -c "pass"'
+            config = HarnessConfig(
+                verify=VerifyConfig(
+                    commands=[VerifyCommandConfig(name="full", run=full_cmd)],
+                    changed_file_rules={"*.txt": [rule_cmd]},
+                ),
+                search=SearchConfig(worktree=False, rounds=1, experts=1, changed_only=True),
+            )
+            # the fake agent writes marker.txt (untracked .txt) -> matches the *.txt rule
+            orch = Orchestrator(
+                config,
+                state=HarnessState(root / ".rsi"),
+                driver_factory=lambda spec: _MarkerDriver("changed"),
+            )
+            orch.run("spec", [ExpertSpec(expert_id="e", driver="codex")], rounds=1, cwd=root, dry_run=False)
+            cand = sorted((root / ".rsi" / "tasks").glob("*/candidates/*"))[0]
+            report = json.loads((cand / "report.json").read_text())
+            commands = [r["command"] for r in report["results"]]
+            self.assertTrue(any("RULE" in c for c in commands), commands)
+
+
+class AgentTimeoutConfigTests(unittest.TestCase):
+    def test_agent_timeout_sec_is_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".rsi.yaml"
+            path.write_text("search:\n  agent_timeout_sec: 42\n", encoding="utf-8")
+            self.assertEqual(load_config(path).search.agent_timeout_sec, 42)
+
+    def test_agent_timeout_is_threaded_into_driver_spec(self) -> None:
+        captured = {}
+
+        def factory(spec: DriverSpec):
+            captured["timeout"] = spec.timeout_sec
+            return _MarkerDriver("x")
+
+        config = HarnessConfig(search=SearchConfig(agent_timeout_sec=42))
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = Orchestrator(config, state=HarnessState(Path(tmp) / ".rsi"), driver_factory=factory)
+            orch._run_expert(ExpertSpec(expert_id="e", driver="codex"), "prompt", Path(tmp), dry_run=True)
+        self.assertEqual(captured["timeout"], 42)
+
+
+class PerLineageFeedbackTests(unittest.TestCase):
+    def test_round2_feedback_is_per_expert_not_shared(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # verify prints the marker the candidate's agent wrote, then fails, so the
+            # marker shows up in that candidate's compacted feedback.
+            run_cmd = f'"{sys.executable}" -c "print(open(\'marker.txt\').read()); import sys; sys.exit(1)"'
+            config = HarnessConfig(
+                verify=VerifyConfig(commands=[VerifyCommandConfig(name="gate", run=run_cmd)]),
+                search=SearchConfig(worktree=False, rounds=2, experts=2),
+            )
+            experts = [
+                ExpertSpec(expert_id="expA", driver="codex", command="ALPHA"),
+                ExpertSpec(expert_id="expB", driver="codex", command="BETA"),
+            ]
+            orch = Orchestrator(
+                config,
+                state=HarnessState(root / ".rsi"),
+                driver_factory=lambda spec: _MarkerDriver(spec.command or ""),
+            )
+            orch.run("spec", experts, rounds=2, cwd=root, dry_run=False)
+
+            prompts = {}
+            for cand_dir in sorted((root / ".rsi" / "tasks").glob("*/candidates/*")):
+                meta = json.loads((cand_dir / "candidate.json").read_text())
+                prompts[(meta["expert_id"], meta["round_index"])] = (cand_dir / "prompt.md").read_text()
+
+            round2_expert_a = prompts[("expA", 2)]
+            self.assertIn("ALPHA", round2_expert_a)  # expert A's own round-1 failure
+            self.assertNotIn("BETA", round2_expert_a)  # not the sibling's last result
+
+
 class OrchestratorIsolationTests(unittest.TestCase):
     def test_worktree_isolation_keeps_candidate_patches_independent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -164,6 +278,25 @@ class OrchestratorIsolationTests(unittest.TestCase):
             with mock.patch("rsi_harness.orchestrator._git_worktree_add", return_value=False), contextlib.redirect_stderr(buf):
                 orch.run("spec", [ExpertSpec(expert_id="e0", driver="codex")], rounds=1, cwd=root, dry_run=True)
             self.assertIn("worktree", buf.getvalue().lower())
+
+
+class PromptVariantTests(unittest.TestCase):
+    def test_variants_produce_distinct_strategy_text(self) -> None:
+        direct = build_candidate_prompt("do the thing", "direct")
+        tests_first = build_candidate_prompt("do the thing", "tests-first")
+        adversarial = build_candidate_prompt("do the thing", "adversarial-review")
+        self.assertIn("failing test", tests_first.lower())
+        self.assertIn("critique", adversarial.lower())
+        self.assertNotEqual(direct, tests_first)
+        self.assertNotEqual(tests_first, adversarial)
+
+    def test_unknown_variant_falls_back_to_label(self) -> None:
+        prompt = build_candidate_prompt("x", "some-custom-variant")
+        self.assertIn("some-custom-variant", prompt)
+
+    def test_feedback_is_appended_when_present(self) -> None:
+        prompt = build_candidate_prompt("x", "direct", "the build failed: missing import")
+        self.assertIn("missing import", prompt)
 
 
 class BehavioralVotingTests(unittest.TestCase):
@@ -442,8 +575,9 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertTrue(payload["hard_pass"])
-        self.assertEqual(payload["results"][0]["name"], "smoke")
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["data"]["hard_pass"])
+        self.assertEqual(payload["data"]["results"][0]["name"], "smoke")
 
 
 class PackagingTests(unittest.TestCase):
@@ -481,6 +615,11 @@ class McpServerTests(unittest.TestCase):
         resp = handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         self.assertEqual(len(resp["result"]["tools"]), 3)
 
+    def test_tool_names_use_underscores_to_match_surfaced_form(self) -> None:
+        resp = handle_request({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+        names = {tool["name"] for tool in resp["result"]["tools"]}
+        self.assertEqual(names, {"rsi_create_task", "rsi_run_verify", "rsi_select_winner"})
+
     def test_malformed_line_returns_parse_error_and_blank_is_ignored(self) -> None:
         resp = process_line("this is not json\n")
         payload = json.loads(resp)
@@ -493,7 +632,7 @@ class McpServerTests(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "tools/call",
-                "params": {"name": "rsi.select_winner", "arguments": {"task_id": "../../etc/passwd"}},
+                "params": {"name": "rsi_select_winner", "arguments": {"task_id": "../../etc/passwd"}},
             }
         )
         self.assertIn("error", resp)
@@ -610,9 +749,9 @@ class CliRunExitCodeTests(unittest.TestCase):
             _write_run_project(root, f'"{sys.executable}" -c "print(0)"')
             result = _run_cli(root, "run", "--task", "make it pass", "--rounds", "1", "--dry-run", "--json")
             self.assertEqual(result.returncode, 0, result.stderr)
-            payload = json.loads(result.stdout)
-            self.assertTrue(payload["hard_pass"])
-            self.assertIsNotNone(payload["winner"])
+            data = json.loads(result.stdout)["data"]
+            self.assertTrue(data["hard_pass"])
+            self.assertIsNotNone(data["winner"])
 
     def test_run_exits_nonzero_when_no_candidate_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -620,8 +759,7 @@ class CliRunExitCodeTests(unittest.TestCase):
             _write_run_project(root, f'"{sys.executable}" -c "import sys; sys.exit(1)"')
             result = _run_cli(root, "run", "--task", "x", "--rounds", "1", "--dry-run", "--json")
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            payload = json.loads(result.stdout)
-            self.assertFalse(payload["hard_pass"])
+            self.assertFalse(json.loads(result.stdout)["data"]["hard_pass"])
 
     def test_run_with_zero_rounds_produces_no_candidates_without_crashing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -629,10 +767,33 @@ class CliRunExitCodeTests(unittest.TestCase):
             _write_run_project(root, f'"{sys.executable}" -c "print(0)"')
             result = _run_cli(root, "run", "--task", "x", "--rounds", "0", "--dry-run", "--json")
             self.assertNotEqual(result.returncode, 0)
+            data = json.loads(result.stdout)["data"]
+            self.assertEqual(data["candidate_count"], 0)
+            self.assertIsNone(data["winner"])
+            self.assertFalse(data["hard_pass"])
+
+
+class JsonEnvelopeTests(unittest.TestCase):
+    def test_verify_json_uses_ok_command_data_envelope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_run_project(root, f'"{sys.executable}" -c "print(0)"')
+            result = _run_cli(root, "verify", "--json")
             payload = json.loads(result.stdout)
-            self.assertEqual(payload["candidate_count"], 0)
-            self.assertIsNone(payload["winner"])
-            self.assertFalse(payload["hard_pass"])
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["command"], "verify")
+            self.assertTrue(payload["data"]["hard_pass"])
+
+    def test_run_json_envelope_and_stderr_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_run_project(root, f'"{sys.executable}" -c "print(0)"')
+            result = _run_cli(root, "run", "--task", "x", "--rounds", "1", "--dry-run", "--json")
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["command"], "run")
+            self.assertIn("candidate_count", payload["data"])
+            self.assertIn("round", result.stderr.lower())  # progress to stderr
 
 
 class CliErrorEnvelopeTests(unittest.TestCase):
@@ -644,6 +805,15 @@ class CliErrorEnvelopeTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertFalse(payload["ok"])
             self.assertIn("error", payload)
+
+    def test_select_non_json_handles_null_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_run_project(root, f'"{sys.executable}" -c "print(0)"')
+            _run_cli(root, "run", "--task", "x", "--rounds", "0", "--dry-run", "--json")
+            result = _run_cli(root, "select")  # non-JSON, winner is null
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("none", result.stdout.lower())
 
 
 class ConfigErrorTests(unittest.TestCase):
