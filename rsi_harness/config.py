@@ -7,11 +7,16 @@ from pathlib import Path
 from typing import Any
 
 
+class ConfigError(Exception):
+    """Raised when a harness config file is present but cannot be parsed or is invalid."""
+
+
 @dataclass(frozen=True)
 class VerifyCommandConfig:
     name: str
     run: str
     timeout_sec: int | None = None
+    max_runtime_sec: int | None = None
 
 
 @dataclass(frozen=True)
@@ -52,17 +57,26 @@ def config_from_dict(data: dict[str, Any]) -> HarnessConfig:
     verify_data = data.get("verify") or {}
     search_data = data.get("search") or {}
     commands = []
-    for item in verify_data.get("commands") or []:
+    for index, item in enumerate(verify_data.get("commands") or []):
         if isinstance(item, str):
             commands.append(VerifyCommandConfig(name=item, run=item))
-        else:
+        elif isinstance(item, dict):
+            if "name" not in item or "run" not in item:
+                raise ConfigError(
+                    f"verify.commands[{index}] must define both 'name' and 'run' (got keys: {sorted(item)})"
+                )
             commands.append(
                 VerifyCommandConfig(
                     name=str(item["name"]),
                     run=str(item["run"]),
-                    timeout_sec=_optional_int(item.get("timeout_sec")),
+                    timeout_sec=_optional_int(item.get("timeout_sec"), key=f"verify.commands[{index}].timeout_sec"),
+                    max_runtime_sec=_optional_int(
+                        item.get("max_runtime_sec"), key=f"verify.commands[{index}].max_runtime_sec"
+                    ),
                 )
             )
+        else:
+            raise ConfigError(f"verify.commands[{index}] must be a string or mapping, got {type(item).__name__}")
 
     changed_rules = {}
     for pattern, rules in (verify_data.get("changed_file_rules") or {}).items():
@@ -72,41 +86,54 @@ def config_from_dict(data: dict[str, Any]) -> HarnessConfig:
             changed_rules[str(pattern)] = [str(rule) for rule in rules]
 
     verify = VerifyConfig(
-        timeout_sec=int(verify_data.get("timeout_sec", 180)),
-        memory_mb=_optional_int(verify_data.get("memory_mb")),
+        timeout_sec=_required_int(verify_data.get("timeout_sec", 180), key="verify.timeout_sec"),
+        memory_mb=_optional_int(verify_data.get("memory_mb"), key="verify.memory_mb"),
         commands=commands,
         changed_file_rules=changed_rules,
     )
     search = SearchConfig(
-        experts=int(search_data.get("experts", 1)),
-        rounds=int(search_data.get("rounds", 1)),
+        experts=_required_int(search_data.get("experts", 1), key="search.experts"),
+        rounds=_required_int(search_data.get("rounds", 1), key="search.rounds"),
         worktree=bool(search_data.get("worktree", False)),
         selector=str(search_data.get("selector", "score")),
-        feedback_budget_chars=int(search_data.get("feedback_budget_chars", 12000)),
+        feedback_budget_chars=_required_int(
+            search_data.get("feedback_budget_chars", 12000), key="search.feedback_budget_chars"
+        ),
         experts_file=str(search_data.get("experts_file", "experts.yaml")),
     )
     return HarnessConfig(verify=verify, search=search)
 
 
-def _optional_int(value: Any) -> int | None:
+def _optional_int(value: Any, key: str = "value") -> int | None:
     if value is None or value == "":
         return None
-    return int(value)
+    return _required_int(value, key=key)
+
+
+def _required_int(value: Any, key: str = "value") -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{key} must be an integer, got {value!r}") from exc
 
 
 def _load_structured_data(raw: str, suffix: str) -> dict[str, Any]:
     if suffix.lower() == ".json":
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(f"Invalid JSON config: {exc}") from exc
 
     try:
         import yaml  # type: ignore
-
-        loaded = yaml.safe_load(raw)
-        return loaded or {}
     except ModuleNotFoundError:
         return _parse_minimal_yaml(raw)
-    except Exception:
-        return _parse_minimal_yaml(raw)
+
+    try:
+        loaded = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"Invalid YAML config: {exc}") from exc
+    return loaded or {}
 
 
 def _parse_minimal_yaml(raw: str) -> dict[str, Any]:
