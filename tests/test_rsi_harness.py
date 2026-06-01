@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from rsi_harness.adapters import DriverRun, DriverSpec, build_driver
+from rsi_harness.corpus import CorpusStats, load_corpus_stats
 from rsi_harness.config import (
     ConfigError,
     HarnessConfig,
@@ -298,6 +299,60 @@ class PromptVariantTests(unittest.TestCase):
         prompt = build_candidate_prompt("x", "direct", "the build failed: missing import")
         self.assertIn("missing import", prompt)
 
+    def test_corpus_hints_section_is_injected(self) -> None:
+        prompt = build_candidate_prompt("x", "direct", corpus_hints="check FOO fails often")
+        self.assertIn("check FOO fails often", prompt)
+        self.assertIn("Lessons from prior runs", prompt)
+
+
+class CorpusFeedbackTests(unittest.TestCase):
+    @staticmethod
+    def _seed(state: HarnessState, expert_id: str, failing_command: str | None = None) -> None:
+        prior = state.create_task("prior task")
+        cand = state.create_candidate(prior.task_id, expert_id, 1, "codex", "diff --git a/x b/x\n")
+        results = [{"name": failing_command, "exit_code": 1, "timed_out": False}] if failing_command else []
+        hard = failing_command is None
+        state.write_candidate_report(prior.task_id, cand.candidate_id, {"hard_pass": hard, "results": results})
+        if hard:
+            state.write_task_artifact(
+                prior.task_id, "selection.json", json.dumps({"winner": {"candidate_id": cand.candidate_id}})
+            )
+
+    def test_use_corpus_orders_experts_by_win_rate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = HarnessState(Path(tmp) / ".rsi")
+            self._seed(state, "expB")  # expB has a prior win; expA has no history
+            config = HarnessConfig(search=SearchConfig(use_corpus=True, rounds=1, experts=2, worktree=False))
+            orch = Orchestrator(config, state=state, driver_factory=lambda spec: _MarkerDriver("m"))
+            orch.run(
+                "new", [ExpertSpec("expA", "codex"), ExpertSpec("expB", "claude")], rounds=1, cwd=Path(tmp), dry_run=True
+            )
+            meta = json.loads((state.task_dir(state.latest_task_id()) / "task.json").read_text())["metadata"]
+            self.assertEqual(meta["experts"], ["expB", "expA"])
+
+    def test_use_corpus_injects_failure_hints_into_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = HarnessState(Path(tmp) / ".rsi")
+            self._seed(state, "expA", failing_command="flaky_integration")
+            config = HarnessConfig(search=SearchConfig(use_corpus=True, rounds=1, experts=1, worktree=False))
+            orch = Orchestrator(config, state=state, driver_factory=lambda spec: _MarkerDriver("m"))
+            orch.run("new", [ExpertSpec("expA", "codex")], rounds=1, cwd=Path(tmp), dry_run=True)
+            cand_dir = sorted((state.task_dir(state.latest_task_id()) / "candidates").iterdir())[0]
+            self.assertIn("flaky_integration", (cand_dir / "prompt.md").read_text())
+
+    def test_default_run_does_not_read_corpus(self) -> None:
+        # use_corpus defaults False: experts keep their given order, no hints.
+        with tempfile.TemporaryDirectory() as tmp:
+            state = HarnessState(Path(tmp) / ".rsi")
+            self._seed(state, "expB")
+            config = HarnessConfig(search=SearchConfig(rounds=1, experts=2, worktree=False))
+            orch = Orchestrator(config, state=state, driver_factory=lambda spec: _MarkerDriver("m"))
+            orch.run(
+                "new", [ExpertSpec("expA", "codex"), ExpertSpec("expB", "claude")], rounds=1, cwd=Path(tmp), dry_run=True
+            )
+            meta = json.loads((state.task_dir(state.latest_task_id()) / "task.json").read_text())["metadata"]
+            self.assertEqual(meta["experts"], ["expA", "expB"])
+
 
 class BehavioralVotingTests(unittest.TestCase):
     def test_behavioral_vote_prefers_larger_agreeing_cluster(self) -> None:
@@ -351,6 +406,66 @@ class ParseTestCountsTests(unittest.TestCase):
     def test_does_not_let_narrative_pollute_pytest_summary(self) -> None:
         text = "2 failed lint rules earlier\n==== 3 failed, 7 passed in 0.4s ===="
         self.assertEqual(_parse_test_counts(text), (7, 10))
+
+
+class CorpusStatsTests(unittest.TestCase):
+    def test_load_corpus_stats_computes_wins_passes_and_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = HarnessState(Path(tmp) / ".rsi")
+            task = state.create_task("t1")
+            winner = state.create_candidate(task.task_id, "expA", 1, "codex", "diff --git a/x b/x\n")
+            state.write_candidate_report(task.task_id, winner.candidate_id, {"hard_pass": True, "results": []})
+            loser = state.create_candidate(task.task_id, "expB", 1, "claude", "diff --git a/y b/y\n")
+            state.write_candidate_report(
+                task.task_id,
+                loser.candidate_id,
+                {"hard_pass": False, "results": [{"name": "unit", "exit_code": 1, "timed_out": False}]},
+            )
+            state.write_task_artifact(
+                task.task_id, "selection.json", json.dumps({"winner": {"candidate_id": winner.candidate_id}})
+            )
+
+            stats = load_corpus_stats(state)
+            self.assertEqual(stats.task_count, 1)
+            self.assertEqual(stats.candidate_count, 2)
+            self.assertEqual(stats.expert_win_counts.get("expA"), 1)
+            self.assertEqual(stats.expert_total_counts.get("expB"), 1)
+            self.assertEqual(stats.expert_hard_pass_counts.get("expA"), 1)
+            self.assertAlmostEqual(stats.expert_win_rate("expA"), 1.0)
+            self.assertAlmostEqual(stats.expert_win_rate("expB"), 0.0)
+            self.assertEqual(stats.failing_commands.get("unit"), 1)
+
+    def test_runtime_exceeded_counts_as_a_failing_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = HarnessState(Path(tmp) / ".rsi")
+            task = state.create_task("t")
+            cand = state.create_candidate(task.task_id, "expA", 1, "codex", "diff")
+            state.write_candidate_report(
+                task.task_id,
+                cand.candidate_id,
+                {
+                    "hard_pass": False,
+                    "results": [{"name": "slow_bench", "exit_code": 0, "timed_out": False, "runtime_exceeded": True}],
+                },
+            )
+            self.assertEqual(load_corpus_stats(state).failing_commands.get("slow_bench"), 1)
+
+    def test_candidate_without_expert_id_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = HarnessState(Path(tmp) / ".rsi")
+            task = state.create_task("t")
+            cand_dir = state.task_dir(task.task_id) / "candidates" / "bogus"
+            cand_dir.mkdir(parents=True)
+            (cand_dir / "candidate.json").write_text(json.dumps({"candidate_id": "bogus"}), encoding="utf-8")
+            stats = load_corpus_stats(state)
+            self.assertEqual(stats.candidate_count, 0)
+            self.assertNotIn("", stats.expert_total_counts)
+
+    def test_load_corpus_stats_on_empty_corpus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            stats = load_corpus_stats(HarnessState(Path(tmp) / ".rsi"))
+            self.assertEqual(stats.task_count, 0)
+            self.assertEqual(stats.expert_win_rate("anything"), 0.0)
 
 
 class ScoreFromReportTests(unittest.TestCase):
@@ -693,6 +808,21 @@ class HookEventLabelTests(unittest.TestCase):
             stdin=json.dumps({"tool_input": {"command": "python -m unittest"}}),
         )
         self.assertEqual(out.strip(), "")
+
+
+class CliLearnTests(unittest.TestCase):
+    def test_learn_json_summarizes_corpus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _write_run_project(root, f'"{sys.executable}" -c "print(0)"')
+            _run_cli(root, "run", "--task", "x", "--rounds", "1", "--dry-run", "--json")
+            result = _run_cli(root, "learn", "--json")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["command"], "learn")
+            self.assertGreaterEqual(payload["data"]["task_count"], 1)
+            self.assertGreaterEqual(payload["data"]["candidate_count"], 1)
 
 
 class CliInitTests(unittest.TestCase):
