@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
-from .cli import cmd_select
 from .config import load_config
 from .orchestrator import commands_from_config
 from .state import HarnessState
 from .verifier import Verifier
+
+
+_TASK_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 TOOLS = [
@@ -40,12 +43,24 @@ TOOLS = [
 
 def main() -> int:
     for line in sys.stdin:
-        if not line.strip():
-            continue
-        request = json.loads(line)
-        response = handle_request(request)
-        print(json.dumps(response), flush=True)
+        response = process_line(line)
+        if response is not None:
+            print(response, flush=True)
     return 0
+
+
+def process_line(line: str) -> str | None:
+    """Turn one stdin line into a JSON-RPC response string (or None for blank lines).
+
+    A malformed line yields a -32700 parse error rather than crashing the loop.
+    """
+    if not line.strip():
+        return None
+    try:
+        request = json.loads(line)
+    except json.JSONDecodeError as exc:
+        return json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": f"Parse error: {exc}"}})
+    return json.dumps(handle_request(request))
 
 
 def handle_request(request: dict[str, Any]) -> dict[str, Any]:
@@ -80,10 +95,17 @@ def _call_tool(params: dict[str, Any]) -> dict[str, Any]:
         report = Verifier(timeout_sec=config.verify.timeout_sec).run(commands_from_config(config), Path.cwd())
         return _text(report.to_json())
     if name == "rsi.select_winner":
-        task_id = str(args.get("task_id") or HarnessState().latest_task_id())
+        raw_task_id = args.get("task_id")
+        task_id = _validate_task_id(str(raw_task_id)) if raw_task_id else HarnessState().latest_task_id()
         selection = HarnessState().task_dir(task_id) / "selection.json"
         return _text(selection.read_text(encoding="utf-8"))
     raise ValueError(f"Unknown tool: {name}")
+
+
+def _validate_task_id(task_id: str) -> str:
+    if ".." in task_id or "/" in task_id or "\\" in task_id or not _TASK_ID_RE.fullmatch(task_id):
+        raise ValueError(f"invalid task_id: {task_id!r}")
+    return task_id
 
 
 def _text(value: str) -> dict[str, Any]:

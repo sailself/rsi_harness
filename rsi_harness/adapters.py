@@ -39,15 +39,27 @@ class AgentDriver:
 
     def run(self, prompt: str, cwd: Path) -> DriverRun:
         argv = self.build_argv(prompt)
-        completed = subprocess.run(
-            argv,
-            cwd=str(cwd),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=self.spec.timeout_sec,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=str(cwd),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=self.spec.timeout_sec,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            # Agent CLI is not installed/on PATH: record a failed candidate
+            # instead of aborting the whole search.
+            return DriverRun(argv=argv, exit_code=127, stdout="", stderr=f"agent command not found: {exc}")
+        except subprocess.TimeoutExpired as exc:
+            return DriverRun(
+                argv=argv,
+                exit_code=-1,
+                stdout=_decode(exc.stdout),
+                stderr=_decode(exc.stderr) + f"\nagent timed out after {self.spec.timeout_sec}s",
+            )
         return DriverRun(
             argv=argv,
             exit_code=completed.returncode,
@@ -81,4 +93,12 @@ def build_driver(spec: DriverSpec) -> AgentDriver:
 
 def _split_command(command: str) -> list[str]:
     return shlex.split(command, posix=os.name != "nt")
+
+
+def _decode(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
 
