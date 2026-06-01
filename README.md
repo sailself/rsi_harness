@@ -171,6 +171,8 @@ Important fields:
 - `search.agent_timeout_sec`: per-agent subprocess timeout (default 900).
 - `search.changed_only`: scope each candidate's verification to its changed files
   via `verify.changed_file_rules` instead of always running `verify.commands`.
+- `search.use_corpus`: read the `.rsi/tasks` corpus before a run to order experts
+  by historical win-rate and seed candidate prompts with recurring-failure hints.
 - `verify.commands[].max_runtime_sec`: optional per-command performance bound; a
   command that finishes but runs longer fails `hard_pass` (distinct from
   `timeout_sec`, which kills a hung command).
@@ -279,6 +281,17 @@ Reads `selection.json` for a task and prints the selected candidate.
 ```sh
 rsi select --task latest --json
 rsi select --task T-20260516000000000000-12345678
+```
+
+### `rsi learn`
+
+Summarizes the persisted `.rsi/tasks` corpus — per-expert win rates and
+hard-pass counts, and the most frequently failing verification commands. This is
+read-only analytics; it is also what `search.use_corpus` consumes to order
+experts and seed prompts on the next run.
+
+```sh
+rsi learn --json
 ```
 
 ### `rsi hook`
@@ -414,8 +427,10 @@ rsi verify --changed --json
 ## Current Limits
 
 This repository is an installable scaffold, not Poetiq's proprietary learned
-meta-system. It does not yet learn new verifier strategies from historical task
-data. Candidate search isolates each candidate in its own Git worktree when
+meta-system. It closes a practical cross-task loop via `search.use_corpus`
+(ordering experts and seeding prompts from prior outcomes), but it does not yet
+automatically optimize its own verifier strategies from historical task data.
+Candidate search isolates each candidate in its own Git worktree when
 `search.worktree` is enabled; with isolation disabled (or outside a Git
 repository) candidates run in the current worktree, so use a clean branch or
 inspect the captured patches carefully when running real external agents.

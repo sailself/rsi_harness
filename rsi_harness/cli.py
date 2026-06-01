@@ -7,6 +7,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import load_config
+from .corpus import load_corpus_stats
 from .hooks import run_hook
 from .orchestrator import Orchestrator, changed_commands_from_config, commands_from_config, load_experts
 from .state import HarnessState
@@ -69,6 +70,8 @@ def _dispatch(args: argparse.Namespace) -> int:
         return cmd_run(args)
     if args.command == "select":
         return cmd_select(args)
+    if args.command == "learn":
+        return cmd_learn(args)
     if args.command == "hook":
         return run_hook(args.event)
     build_parser().print_help()
@@ -127,6 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
     select = sub.add_parser("select", help="Print selection for a task")
     select.add_argument("--task", default="latest")
     select.add_argument("--json", action="store_true")
+
+    learn = sub.add_parser("learn", help="Summarize learnings from the .rsi/tasks corpus")
+    learn.add_argument("--json", action="store_true")
 
     hook = sub.add_parser("hook", help="Run a Codex/Claude lifecycle hook")
     hook.add_argument("event", choices=["session-start", "prompt-submit", "pre-tool", "post-tool", "stop"])
@@ -207,6 +213,21 @@ def cmd_select(args: argparse.Namespace) -> int:
             print(f"score={winner['score']}")
         else:
             print("winner=none (no candidates)")
+    return 0
+
+
+def cmd_learn(args: argparse.Namespace) -> int:
+    stats = load_corpus_stats(HarnessState())
+    if args.json:
+        _emit_json("learn", stats.to_dict())
+    else:
+        print(f"tasks={stats.task_count} candidates={stats.candidate_count}")
+        for expert in sorted(stats.expert_total_counts):
+            total = stats.expert_total_counts[expert]
+            passes = stats.expert_hard_pass_counts.get(expert, 0)
+            print(f"{expert}: win_rate={stats.expert_win_rate(expert):.2f} hard_pass={passes}/{total}")
+        for name, count in stats.top_failing_commands():
+            print(f"failing: {name} x{count}")
     return 0
 
 
