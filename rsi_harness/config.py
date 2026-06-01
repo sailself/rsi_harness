@@ -35,6 +35,8 @@ class SearchConfig:
     selector: str = "score"
     feedback_budget_chars: int = 12000
     experts_file: str = "experts.yaml"
+    agent_timeout_sec: int = 900
+    changed_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,8 @@ def config_from_dict(data: dict[str, Any]) -> HarnessConfig:
             search_data.get("feedback_budget_chars", 12000), key="search.feedback_budget_chars"
         ),
         experts_file=str(search_data.get("experts_file", "experts.yaml")),
+        agent_timeout_sec=_required_int(search_data.get("agent_timeout_sec", 900), key="search.agent_timeout_sec"),
+        changed_only=bool(search_data.get("changed_only", False)),
     )
     return HarnessConfig(verify=verify, search=search)
 

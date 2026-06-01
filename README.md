@@ -162,8 +162,18 @@ Important fields:
   missing.
 - `search.rounds`: default number of candidate-generation rounds.
 - `search.feedback_budget_chars`: maximum feedback text carried into the next
-  candidate prompt.
+  candidate prompt (kept per expert, so each expert repairs its own prior round).
 - `search.experts_file`: default experts file for `rsi run`.
+- `search.selector`: `score` (default) or `behavioral_vote` (cluster candidates
+  by verification output and reward self-consistent agreement).
+- `search.worktree`: when true, run and verify each candidate in an isolated Git
+  worktree rooted at `HEAD`.
+- `search.agent_timeout_sec`: per-agent subprocess timeout (default 900).
+- `search.changed_only`: scope each candidate's verification to its changed files
+  via `verify.changed_file_rules` instead of always running `verify.commands`.
+- `verify.commands[].max_runtime_sec`: optional per-command performance bound; a
+  command that finishes but runs longer fails `hard_pass` (distinct from
+  `timeout_sec`, which kills a hung command).
 
 The config loader accepts YAML when PyYAML is installed and otherwise falls back
 to the minimal YAML subset used by the starter config.
@@ -193,6 +203,15 @@ Supported drivers are `codex`, `claude` or `claude-code`, and `opencode`.
 The command is split into argv form, the generated prompt is appended, and the
 agent runs in the current working directory. If a command contains a `{prompt}`
 argument, that argument is replaced instead of appending the prompt.
+
+`prompt_variant` selects a real strategy block injected into the candidate
+prompt: `direct` (minimal change), `tests-first` (write failing tests first), or
+`adversarial-review` (self-critique and harden). An unrecognized variant is
+passed through as a label.
+
+All `--json` output uses a uniform envelope: `{"ok": true, "command": "<name>",
+"data": {...}}` on success, and `{"ok": false, "command": "<name>", "error":
+{"type", "message"}}` on failure. Consumers should read the `data` field.
 
 ## Core Commands
 

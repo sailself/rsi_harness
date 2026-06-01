@@ -75,10 +75,23 @@ def _dispatch(args: argparse.Namespace) -> int:
     return 2
 
 
+def _emit_json(command: str, data: object) -> None:
+    print(json.dumps({"ok": True, "command": command, "data": data}, indent=2))
+
+
 def _report_error(args: argparse.Namespace, exc: Exception) -> int:
     message = str(exc) or exc.__class__.__name__
     if getattr(args, "json", False):
-        print(json.dumps({"ok": False, "error": {"type": type(exc).__name__, "message": message}}, indent=2))
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "command": getattr(args, "command", None),
+                    "error": {"type": type(exc).__name__, "message": message},
+                },
+                indent=2,
+            )
+        )
     else:
         print(f"error: {message}", file=sys.stderr)
     # Exit 2 marks an internal/usage error, distinct from a clean "verification did
@@ -138,7 +151,7 @@ def cmd_verify(args: argparse.Namespace) -> int:
     commands = changed_commands_from_config(config, Path.cwd()) if args.changed else commands_from_config(config)
     report = Verifier(timeout_sec=config.verify.timeout_sec).run(commands, Path.cwd())
     if args.json:
-        print(report.to_json())
+        _emit_json("verify", report.to_dict())
     else:
         _print_report(report.to_dict())
     return 0 if report.hard_pass else 1
@@ -147,12 +160,15 @@ def cmd_verify(args: argparse.Namespace) -> int:
 def cmd_task(args: argparse.Namespace) -> int:
     spec = " ".join(args.spec)
     task = HarnessState().create_task(spec)
-    payload = task.__dict__
     if args.json:
-        print(json.dumps(payload, indent=2))
+        _emit_json("task", task.__dict__)
     else:
         print(task.path)
     return 0
+
+
+def _stderr_progress(round_index: int, rounds: int, expert_id: str) -> None:
+    print(f"rsi: round {round_index}/{rounds} expert {expert_id}", file=sys.stderr)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -161,9 +177,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     experts_path = Path(args.experts or config.search.experts_file)
     experts = load_experts(experts_path, fallback_count=config.search.experts)
     task_spec = _read_task_arg(args.task)
-    selection = Orchestrator(config).run(task_spec, experts, rounds, Path.cwd(), dry_run=args.dry_run)
+    selection = Orchestrator(config).run(
+        task_spec, experts, rounds, Path.cwd(), dry_run=args.dry_run, on_progress=_stderr_progress
+    )
     if args.json:
-        print(json.dumps(selection, indent=2))
+        _emit_json("run", selection)
     else:
         print(f"task={selection['task_id']}")
         winner = selection.get("winner")
@@ -181,10 +199,14 @@ def cmd_select(args: argparse.Namespace) -> int:
         return 1
     payload = json.loads(selection_path.read_text(encoding="utf-8"))
     if args.json:
-        print(json.dumps(payload, indent=2))
+        _emit_json("select", payload)
     else:
-        print(f"winner={payload['winner']['candidate_id']}")
-        print(f"score={payload['winner']['score']}")
+        winner = payload.get("winner")
+        if winner:
+            print(f"winner={winner['candidate_id']}")
+            print(f"score={winner['score']}")
+        else:
+            print("winner=none (no candidates)")
     return 0
 
 
