@@ -68,12 +68,17 @@ class Orchestrator:
         rounds: int,
         cwd: Path,
         dry_run: bool = False,
+        on_progress: Callable[[int, int, str], None] | None = None,
     ) -> dict[str, Any]:
         task = self.state.create_task(task_spec, {"rounds": rounds, "experts": [expert.expert_id for expert in experts]})
-        feedback = ""
+        feedback_by_expert: dict[str, str] = {}
         scores: list[CandidateScore] = []
         for round_index in range(1, rounds + 1):
             for expert in experts:
+                if on_progress is not None:
+                    on_progress(round_index, rounds, expert.expert_id)
+                # Each expert repairs its OWN prior-round failure, not a sibling's last result.
+                feedback = feedback_by_expert.get(expert.expert_id, "")
                 prompt = build_candidate_prompt(task_spec, expert.prompt_variant, feedback)
                 # Each candidate runs (and is verified) in its own isolated workspace
                 # rooted at the task baseline, so its captured patch and verification
@@ -92,13 +97,18 @@ class Orchestrator:
                     (candidate_dir / "prompt.md").write_text(prompt, encoding="utf-8")
                     (candidate_dir / "agent.json").write_text(json.dumps(candidate_output, indent=2), encoding="utf-8")
 
-                    report = self.verifier.run(commands_from_config(self.config), work_cwd)
+                    commands = (
+                        changed_commands_from_config(self.config, work_cwd)
+                        if self.config.search.changed_only
+                        else commands_from_config(self.config)
+                    )
+                    report = self.verifier.run(commands, work_cwd)
                 report_doc = report.to_dict()
                 report_doc["argv"] = candidate_output.get("argv")
                 report_doc["agent_exit_code"] = candidate_output.get("exit_code")
                 self.state.write_candidate_report(task.task_id, candidate.candidate_id, report_doc)
                 scores.append(score_from_report(candidate.candidate_id, report, patch_text))
-                feedback = compact_feedback(report, self.config.search.feedback_budget_chars)
+                feedback_by_expert[expert.expert_id] = compact_feedback(report, self.config.search.feedback_budget_chars)
 
         winner = select_winner(scores, selector=self.config.search.selector) if scores else None
         selection = {
@@ -115,6 +125,7 @@ class Orchestrator:
             driver=expert.driver,
             command=expert.command,
             extra_args=expert.extra_args,
+            timeout_sec=self.config.search.agent_timeout_sec,
         )
         driver = self.driver_factory(spec)
         argv = driver.build_argv(prompt)
@@ -183,9 +194,20 @@ def changed_commands_from_config(config: HarnessConfig, cwd: Path) -> list[Verif
 
 
 def git_changed_files(cwd: Path) -> list[str]:
+    # Modified tracked files plus newly-created untracked files, so that adding a
+    # brand-new source file still triggers its changed_file_rules.
+    tracked = _git_lines(["git", "diff", "--name-only", "HEAD"], cwd)
+    untracked = _git_lines(["git", "ls-files", "--others", "--exclude-standard"], cwd)
+    merged = dict.fromkeys(tracked + untracked)
+    # Never treat the harness's own state directory as a changed source file —
+    # otherwise a changed_file_rule like "*.json" would match .rsi/ artifacts.
+    return [path for path in merged if path != ".rsi" and not path.startswith(".rsi/")]
+
+
+def _git_lines(argv: list[str], cwd: Path) -> list[str]:
     try:
         completed = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
+            argv,
             cwd=str(cwd),
             text=True,
             stdout=subprocess.PIPE,
@@ -264,14 +286,29 @@ def capture_git_diff(cwd: Path) -> str:
     return completed.stdout if completed.returncode == 0 else ""
 
 
+PROMPT_VARIANTS = {
+    "direct": "Strategy (direct): implement the smallest correct change; keep the patch minimal and focused.",
+    "tests-first": (
+        "Strategy (tests-first): first add failing tests that capture the required behavior, "
+        "then implement until they pass."
+    ),
+    "adversarial-review": (
+        "Strategy (adversarial-review): after drafting the patch, critique it for edge cases, "
+        "security issues, and regressions, then harden it before finalizing."
+    ),
+}
+
+
 def build_candidate_prompt(task_spec: str, prompt_variant: str, feedback: str = "") -> str:
     parts = [
         "# RSI candidate task",
         "",
         task_spec.strip(),
         "",
-        "Produce a focused patch. Prefer tests first, run the configured verification, and explain residual risk.",
-        f"Prompt variant: {prompt_variant}",
+        "Produce a focused patch, run the configured verification, and explain residual risk.",
+        # A known variant selects a real strategy block; an unknown one is passed
+        # through as a label so custom variants still reach the agent.
+        PROMPT_VARIANTS.get(prompt_variant, f"Prompt variant: {prompt_variant}"),
     ]
     if feedback:
         parts.extend(["", "## Previous executable feedback", feedback])
