@@ -359,9 +359,18 @@ score =
 ```
 
 A failing candidate should not beat a passing candidate on style or confidence.
-The current implementation derives these signals from verification results and
-patch size; richer quality and behavioral voting signals can be added on top of
-the persisted artifact corpus.
+`test_pass_rate` is parsed from the test runner's output (unittest/pytest),
+`risk_score` is derived from diff deletions, and `static_quality_score` rewards a
+real unified diff over agent chatter. **Behavioral voting** is available by
+setting `search.selector: behavioral_vote`: candidates are clustered by their
+verification `output_bucket` and rewarded for self-consistent agreement
+(normalized vote share). The default `selector: score` skips clustering. Ties are
+broken on merit (test pass rate, vote share, smaller and faster patch) before
+falling back to the candidate id.
+
+A command may also set `max_runtime_sec` to make runtime a hard gate (a command
+that finishes but runs too long is excluded from `hard_pass`), distinct from the
+`timeout_sec` that kills a hung command. `verify.memory_mb` remains metadata only.
 
 ## Development
 

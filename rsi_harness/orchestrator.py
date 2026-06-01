@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -99,7 +100,7 @@ class Orchestrator:
                 scores.append(score_from_report(candidate.candidate_id, report, patch_text))
                 feedback = compact_feedback(report, self.config.search.feedback_budget_chars)
 
-        winner = select_winner(scores) if scores else None
+        winner = select_winner(scores, selector=self.config.search.selector) if scores else None
         selection = {
             "task_id": task.task_id,
             "winner": winner.__dict__ if winner else None,
@@ -156,7 +157,12 @@ class Orchestrator:
 
 def commands_from_config(config: HarnessConfig) -> list[VerificationCommand]:
     return [
-        VerificationCommand(name=command.name, run=command.run, timeout_sec=command.timeout_sec)
+        VerificationCommand(
+            name=command.name,
+            run=command.run,
+            timeout_sec=command.timeout_sec,
+            max_runtime_sec=command.max_runtime_sec,
+        )
         for command in config.verify.commands
     ]
 
@@ -284,19 +290,91 @@ def compact_feedback(report: VerificationReport, budget_chars: int) -> str:
 
 
 def score_from_report(candidate_id: str, report: VerificationReport, patch_text: str) -> CandidateScore:
-    pass_count = sum(1 for result in report.results if result.exit_code == 0 and not result.timed_out)
-    total = len(report.results) or 1
     patch_penalty = min(len(patch_text) / 20000, 10)
     runtime_penalty = min(report.runtime_sec / 120, 10)
     return CandidateScore(
         candidate_id=candidate_id,
         hard_pass=report.hard_pass,
-        test_pass_rate=pass_count / total,
+        test_pass_rate=_test_pass_rate(report),
         generated_test_pass_rate=0.0,
         behavioral_vote_count=1,
-        static_quality_score=0.5 if patch_text else 0.0,
-        risk_score=0.0 if report.hard_pass else 1.0,
+        static_quality_score=0.5 if _looks_like_diff(patch_text) else 0.0,
+        risk_score=_diff_risk(patch_text),
         normalized_runtime=runtime_penalty,
         patch_size_penalty=patch_penalty,
+        output_bucket=report.output_bucket,
     )
+
+
+def _test_pass_rate(report: VerificationReport) -> float:
+    """Fraction of passing tests, parsed from runner output when possible.
+
+    Falls back to the fraction of verification *commands* that passed when no
+    machine-readable test counts (unittest/pytest) can be parsed.
+    """
+    counts = [
+        parsed
+        for parsed in (_parse_test_counts((r.stdout or "") + "\n" + (r.stderr or "")) for r in report.results)
+        if parsed is not None
+    ]
+    if counts:
+        passed = sum(p for p, _ in counts)
+        total = sum(t for _, t in counts) or 1
+        return passed / total
+    pass_count = sum(1 for result in report.results if result.exit_code == 0 and not result.timed_out)
+    return pass_count / (len(report.results) or 1)
+
+
+def _parse_test_counts(text: str) -> tuple[int, int] | None:
+    """Return (passed, countable_total) parsed from unittest or pytest output, or None.
+
+    Skipped tests are excluded from both passed and total (they are neutral, not
+    wins). To avoid false positives, the pytest path only reads the framed summary
+    line (e.g. ``==== 3 failed, 7 passed in 0.4s ====``), never arbitrary prose.
+    """
+    # unittest: "Ran N tests" plus an OK/FAILED detail block using name=N tokens.
+    ran = re.search(r"Ran (\d+) tests?\b", text)
+    if ran:
+        total = int(ran.group(1))
+        skipped = _named_count(text, "skipped")
+        failed = _named_count(text, "failures") + _named_count(text, "errors")
+        countable = total - skipped
+        if countable <= 0:
+            return None
+        return max(countable - failed, 0), countable
+
+    # pytest: trust ONLY the framed summary line, not narrative output elsewhere.
+    summary = re.search(r"^=+.*\b\d+\s+(?:passed|failed|errors?|skipped)\b.*=+\s*$", text, re.MULTILINE)
+    if not summary:
+        return None
+    line = summary.group(0)
+    passed = _word_count(line, "passed")
+    failed = _word_count(line, "failed") + _word_count(line, "error")
+    countable = passed + failed
+    return (passed, countable) if countable else None
+
+
+def _named_count(text: str, name: str) -> int:
+    """Read a unittest-style ``name=N`` count (e.g. failures=2, skipped=3)."""
+    match = re.search(name + r"=(\d+)", text)
+    return int(match.group(1)) if match else 0
+
+
+def _word_count(text: str, word: str) -> int:
+    """Read a pytest-style ``N word`` count (e.g. 7 passed, 1 error)."""
+    match = re.search(r"(\d+)\s+" + word, text)
+    return int(match.group(1)) if match else 0
+
+
+def _diff_risk(patch_text: str) -> float:
+    """Risk proxy from a unified diff: more deleted lines => higher risk, capped at 1.0."""
+    deletions = sum(
+        1 for line in patch_text.splitlines() if line.startswith("-") and not line.startswith("---")
+    )
+    return min(deletions / 100.0, 1.0)
+
+
+def _looks_like_diff(patch_text: str) -> bool:
+    stripped = patch_text.lstrip()
+    return "diff --git" in patch_text or stripped.startswith("diff ") or "@@" in patch_text
 

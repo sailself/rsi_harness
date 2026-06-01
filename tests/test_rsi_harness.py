@@ -20,10 +20,22 @@ from rsi_harness.config import (
 )
 from rsi_harness.hooks import run_hook
 from rsi_harness.mcp_server import handle_request, process_line
-from rsi_harness.orchestrator import ExpertSpec, Orchestrator
-from rsi_harness.selector import CandidateScore, select_winner
+from rsi_harness.orchestrator import (
+    ExpertSpec,
+    Orchestrator,
+    _parse_test_counts,
+    commands_from_config,
+    score_from_report,
+)
+from rsi_harness.selector import CandidateScore, score_candidate, select_winner
 from rsi_harness.state import HarnessState
-from rsi_harness.verifier import VerificationCommand, Verifier
+from rsi_harness.verifier import (
+    CommandResult,
+    VerificationCommand,
+    VerificationReport,
+    Verifier,
+    _output_bucket,
+)
 
 
 def _yaml_scalar(text: str) -> str:
@@ -152,6 +164,97 @@ class OrchestratorIsolationTests(unittest.TestCase):
             with mock.patch("rsi_harness.orchestrator._git_worktree_add", return_value=False), contextlib.redirect_stderr(buf):
                 orch.run("spec", [ExpertSpec(expert_id="e0", driver="codex")], rounds=1, cwd=root, dry_run=True)
             self.assertIn("worktree", buf.getvalue().lower())
+
+
+class BehavioralVotingTests(unittest.TestCase):
+    def test_behavioral_vote_prefers_larger_agreeing_cluster(self) -> None:
+        scores = [
+            CandidateScore(candidate_id="a", hard_pass=True, output_bucket="X"),
+            CandidateScore(candidate_id="b", hard_pass=True, output_bucket="X"),
+            CandidateScore(candidate_id="c", hard_pass=True, output_bucket="Y"),
+        ]
+        winner = select_winner(scores, selector="behavioral_vote")
+        self.assertIn(winner.candidate_id, {"a", "b"})  # the 2-agreement cluster beats the lone one
+        self.assertAlmostEqual(winner.behavioral_vote_count, 2 / 3)  # normalized share, not raw count
+
+    def test_score_selector_leaves_vote_count_at_default(self) -> None:
+        scores = [
+            CandidateScore(candidate_id="a", hard_pass=True, output_bucket="X", test_pass_rate=1.0),
+            CandidateScore(candidate_id="b", hard_pass=True, output_bucket="Y", test_pass_rate=1.0),
+        ]
+        winner = select_winner(scores, selector="score")
+        self.assertEqual(winner.behavioral_vote_count, 1)
+
+
+class TieBreakTests(unittest.TestCase):
+    def test_tie_break_uses_merit_not_largest_candidate_id(self) -> None:
+        # Constructed so both score exactly 1070, but "aaa" has the higher test_pass_rate.
+        a = CandidateScore(candidate_id="aaa", hard_pass=True, test_pass_rate=1.0, patch_size_penalty=8.0)
+        b = CandidateScore(candidate_id="zzz", hard_pass=True, test_pass_rate=0.5, patch_size_penalty=0.0)
+        self.assertAlmostEqual(score_candidate(a).score, score_candidate(b).score)
+        winner = select_winner([a, b])
+        self.assertEqual(winner.candidate_id, "aaa")  # merit (test_pass_rate) wins, not the larger id
+
+
+class ParseTestCountsTests(unittest.TestCase):
+    def test_unittest_failures_and_errors(self) -> None:
+        self.assertEqual(_parse_test_counts("Ran 10 tests in 0.5s\n\nFAILED (failures=2, errors=1)"), (7, 10))
+
+    def test_unittest_all_pass(self) -> None:
+        self.assertEqual(_parse_test_counts("Ran 5 tests in 0.1s\n\nOK"), (5, 5))
+
+    def test_unittest_skips_are_neutral_not_counted_as_passed(self) -> None:
+        # 5 ran, 3 skipped, 0 failed -> 2 of 2 countable passed (skips excluded)
+        self.assertEqual(_parse_test_counts("Ran 5 tests in 0.1s\n\nOK (skipped=3)"), (2, 2))
+
+    def test_pytest_framed_summary(self) -> None:
+        text = "collected 10 items\n==== 3 failed, 7 passed in 0.4s ===="
+        self.assertEqual(_parse_test_counts(text), (7, 10))
+
+    def test_ignores_unframed_narrative_counts(self) -> None:
+        # Not a test runner summary -> no signal (must not invent counts).
+        self.assertIsNone(_parse_test_counts("Found 5 errors in the log file"))
+
+    def test_does_not_let_narrative_pollute_pytest_summary(self) -> None:
+        text = "2 failed lint rules earlier\n==== 3 failed, 7 passed in 0.4s ===="
+        self.assertEqual(_parse_test_counts(text), (7, 10))
+
+
+class ScoreFromReportTests(unittest.TestCase):
+    @staticmethod
+    def _report(results: list, hard_pass: bool = True) -> VerificationReport:
+        return VerificationReport(hard_pass=hard_pass, results=results, runtime_sec=0.0, output_bucket="b")
+
+    def test_test_pass_rate_uses_parsed_unittest_counts(self) -> None:
+        # unittest writes its summary to stderr; 7 of 10 passed.
+        result = CommandResult(
+            name="unit",
+            command="python -m unittest",
+            exit_code=1,
+            stdout="",
+            stderr="Ran 10 tests in 0.5s\n\nFAILED (failures=2, errors=1)",
+            runtime_sec=0.5,
+        )
+        score = score_from_report("c", self._report([result], hard_pass=False), "diff --git a/x b/x\n+1\n")
+        self.assertAlmostEqual(score.test_pass_rate, 0.7)
+
+    def test_test_pass_rate_falls_back_to_command_level(self) -> None:
+        passing = CommandResult(name="a", command="lint", exit_code=0, stdout="clean", stderr="", runtime_sec=0.0)
+        failing = CommandResult(name="b", command="build", exit_code=1, stdout="boom", stderr="", runtime_sec=0.0)
+        score = score_from_report("c", self._report([passing, failing], hard_pass=False), "")
+        self.assertAlmostEqual(score.test_pass_rate, 0.5)
+
+    def test_risk_score_increases_with_deletions(self) -> None:
+        report = self._report([], hard_pass=True)
+        few = score_from_report("a", report, "diff --git a/x b/x\n+added\n")
+        many = score_from_report("b", report, "diff --git a/x b/x\n" + "-gone\n" * 60 + "+x\n")
+        self.assertLess(few.risk_score, many.risk_score)
+
+    def test_static_quality_rewards_real_diff_over_chatter(self) -> None:
+        report = self._report([], hard_pass=True)
+        diff = score_from_report("a", report, "diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b\n")
+        chatter = score_from_report("b", report, "Sure! I updated the parser to handle the edge case.")
+        self.assertGreater(diff.static_quality_score, chatter.static_quality_score)
 
 
 class ConfigTests(unittest.TestCase):
@@ -568,6 +671,65 @@ class ConfigErrorTests(unittest.TestCase):
             path.write_text("verify:\n  timeout_sec: not-a-number\n", encoding="utf-8")
             with self.assertRaises(ConfigError):
                 load_config(path)
+
+
+class OutputBucketTests(unittest.TestCase):
+    @staticmethod
+    def _result(stdout: str, exit_code: int = 0) -> CommandResult:
+        return CommandResult(name="t", command="c", exit_code=exit_code, stdout=stdout, stderr="", runtime_sec=0.0)
+
+    def test_bucket_is_stable_across_test_durations(self) -> None:
+        a = _output_bucket([self._result("Ran 3 tests in 0.12s\n\nOK")])
+        b = _output_bucket([self._result("Ran 3 tests in 9.87s\n\nOK")])
+        self.assertEqual(a, b)
+
+    def test_bucket_changes_on_real_output_difference(self) -> None:
+        a = _output_bucket([self._result("Ran 3 tests in 0.12s\n\nOK")])
+        b = _output_bucket([self._result("Ran 4 tests in 0.12s\n\nOK")])
+        self.assertNotEqual(a, b)
+
+    def test_bucket_strips_ansi_color(self) -> None:
+        a = _output_bucket([self._result("\x1b[32mPASSED\x1b[0m")])
+        b = _output_bucket([self._result("PASSED")])
+        self.assertEqual(a, b)
+
+
+class ConfigRuntimeGateTests(unittest.TestCase):
+    def test_max_runtime_sec_is_parsed_and_threaded_to_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".rsi.yaml"
+            path.write_text(
+                "verify:\n  commands:\n    - name: unit\n      run: pytest\n      max_runtime_sec: 5\n",
+                encoding="utf-8",
+            )
+            config = load_config(path)
+            self.assertEqual(config.verify.commands[0].max_runtime_sec, 5)
+            self.assertEqual(commands_from_config(config)[0].max_runtime_sec, 5)
+
+
+class VerifierRuntimeGateTests(unittest.TestCase):
+    def test_command_exceeding_max_runtime_is_excluded_from_hard_pass(self) -> None:
+        command = VerificationCommand(
+            name="slow-but-ok",
+            run=f'"{sys.executable}" -c "import time; time.sleep(2)"',
+            timeout_sec=30,
+            max_runtime_sec=1,
+        )
+        report = Verifier().run([command], cwd=Path.cwd())
+        self.assertEqual(report.results[0].exit_code, 0)  # it completed successfully
+        self.assertTrue(report.results[0].runtime_exceeded)  # but it was too slow
+        self.assertFalse(report.hard_pass)
+
+    def test_fast_command_within_max_runtime_hard_passes(self) -> None:
+        command = VerificationCommand(
+            name="fast",
+            run=f'"{sys.executable}" -c "pass"',
+            timeout_sec=30,
+            max_runtime_sec=30,
+        )
+        report = Verifier().run([command], cwd=Path.cwd())
+        self.assertFalse(report.results[0].runtime_exceeded)
+        self.assertTrue(report.hard_pass)
 
 
 class VerifierTimeoutTests(unittest.TestCase):

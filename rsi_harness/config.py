@@ -16,6 +16,7 @@ class VerifyCommandConfig:
     name: str
     run: str
     timeout_sec: int | None = None
+    max_runtime_sec: int | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,9 @@ def config_from_dict(data: dict[str, Any]) -> HarnessConfig:
                     name=str(item["name"]),
                     run=str(item["run"]),
                     timeout_sec=_optional_int(item.get("timeout_sec"), key=f"verify.commands[{index}].timeout_sec"),
+                    max_runtime_sec=_optional_int(
+                        item.get("max_runtime_sec"), key=f"verify.commands[{index}].max_runtime_sec"
+                    ),
                 )
             )
         else:
