@@ -25,7 +25,8 @@ def run_hook(event: str, stdin: str | None = None, cwd: Path | None = None) -> i
     cwd = cwd or Path.cwd()
     if event == "session-start":
         _emit_context(
-            "RSI harness is available. For complex coding tasks, create a measurable task spec, run `rsi verify --json`, preserve executable feedback, and finish with exact verification evidence."
+            "RSI harness is available. For complex coding tasks, create a measurable task spec, run `rsi verify --json`, preserve executable feedback, and finish with exact verification evidence.",
+            "session-start",
         )
         return 0
     if event == "prompt-submit":
@@ -46,7 +47,7 @@ def _prompt_submit(payload: dict[str, Any], cwd: Path) -> int:
         return 0
     state = HarnessState(cwd / ".rsi")
     task = state.create_task(prompt, {"source": "UserPromptSubmit"})
-    _emit_context(f"RSI task created at {task.path}. Keep candidate evidence under this task.")
+    _emit_context(f"RSI task created at {task.path}. Keep candidate evidence under this task.", "prompt-submit")
     return 0
 
 
@@ -81,7 +82,10 @@ def _post_tool(cwd: Path) -> int:
     (feedback_dir / "latest.json").write_text(report.to_json(), encoding="utf-8")
     if not report.hard_pass:
         failed = [result.name for result in report.results if result.exit_code != 0 or result.timed_out]
-        _emit_context(f"RSI verification failed after the last tool use: {', '.join(failed)}. Read .rsi/hook-feedback/latest.json before continuing.")
+        _emit_context(
+            f"RSI verification failed after the last tool use: {', '.join(failed)}. Read .rsi/hook-feedback/latest.json before continuing.",
+            "post-tool",
+        )
     return 0
 
 
@@ -91,16 +95,32 @@ def _stop(cwd: Path) -> int:
         return 0
     report = json.loads(latest.read_text(encoding="utf-8"))
     if not report.get("hard_pass", False):
-        _emit_context("RSI stop gate: latest verification report is not green. Continue repair or report the residual failing command explicitly.")
+        _emit_context(
+            "RSI stop gate: latest verification report is not green. Continue repair or report the residual failing command explicitly.",
+            "stop",
+        )
     return 0
 
 
-def _emit_context(text: str) -> None:
+_HOOK_EVENT_NAMES = {
+    "session-start": "SessionStart",
+    "prompt-submit": "UserPromptSubmit",
+    "post-tool": "PostToolUse",
+    "stop": "Stop",
+}
+
+
+def _emit_context(text: str, event: str) -> None:
+    # Stop hooks have no additionalContext channel in the host contract, so a
+    # top-level systemMessage is the portable way to surface advisory text.
+    if event == "stop":
+        print(json.dumps({"systemMessage": text}))
+        return
     print(
         json.dumps(
             {
                 "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
+                    "hookEventName": _HOOK_EVENT_NAMES.get(event, "SessionStart"),
                     "additionalContext": text,
                 }
             }

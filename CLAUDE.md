@@ -31,7 +31,7 @@ pip install -e .
 python -m rsi_harness.mcp_server
 ```
 
-There is **no separate lint/typecheck/format step** — the test suite (`tests/test_rsi_harness.py`, 7 tests, one class per module) is the only gate, and `rsi verify` in this repo just runs it.
+There is **no separate lint/typecheck/format step** — the test suite (`tests/test_rsi_harness.py`) is the only gate, and `rsi verify` in this repo just runs it.
 
 PyYAML is optional: `config.py` falls back to an in-repo minimal YAML parser when it is absent. The external agent CLIs (`codex`, `claude`, `opencode`) are only needed for *real* `rsi run` candidate generation — use `--dry-run` to exercise the loop without them.
 
@@ -99,15 +99,17 @@ The plugin manifests (`.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`)
 ## Non-obvious behaviors (these will bite you)
 
 - **Single-test invocation.** `python -m unittest tests.test_rsi_harness.<Class>.<method>` **fails** — there is no `tests/__init__.py`, so `tests` is not an importable package, and running the module from the `tests/` dir loses `rsi_harness` from `sys.path`. The only form that satisfies both constraints is `discover -s tests -p test_rsi_harness.py -k <name>`.
-- **`rsi run` always exits 0**, even when agents or verification fail — the orchestrator always produces a selection. Never gate on its exit code; read `selection.json` / candidate `report.json`. (`rsi verify` does exit 1 on hard-fail; `rsi` with no subcommand exits 2.)
-- **Candidate patches accumulate.** Patches are captured via `git diff --binary` of the working tree and are **never reset between candidates**, so each candidate's `.patch` includes the cumulative changes of all prior candidates in the run. Run real searches on a clean throwaway branch and inspect patches carefully.
+- **`rsi run` exit code reflects verification.** It returns `0` only when the selected winner hard-passed, else `1`; the selection dict carries a top-level `hard_pass`, and an empty candidate set yields `winner: null` instead of crashing. (`rsi verify` exits 1 on hard-fail; `rsi` with no subcommand exits 2.)
+- **Candidate isolation.** When `search.worktree: true` (the default written by `rsi init`) and `cwd` is a git repo with a commit, each candidate runs and is verified in a throwaway detached `git worktree` rooted at HEAD, so its captured `.patch` and verification reflect only that candidate and the caller's working tree is never touched (`orchestrator.py` `_candidate_workspace`). With `worktree: false` (or no git), candidates share `cwd` and their diffs accumulate — use a clean branch there.
 - **`prompt_variant` is advisory text only.** `build_candidate_prompt` injects it as a literal `Prompt variant: <x>` line; there is no code branching on `direct` / `tests-first` / `adversarial-review`. Arbitrary strings are accepted.
 - **`changed_file_rules` does NOT affect `rsi run`.** The run loop always uses the full `verify.commands` (`commands_from_config`). The changed-file rules only apply to `rsi verify --changed` and the `post-tool` hook (`changed_commands_from_config`, which falls back to the full set when no glob matches).
 - **Scoring signals are partly stubbed.** `score_from_report` hardcodes `generated_test_pass_rate=0.0` and `behavioral_vote_count=1`; current scoring is effectively hard-pass + test-pass-rate + patch/runtime penalties. The persisted `.rsi/tasks` corpus is the intended extension point for richer signals.
-- **Agent timeout is hardcoded to 900s.** `config.verify.timeout_sec` applies to *verification commands*, not agent subprocesses (`_run_expert` never passes `timeout_sec`).
-- **`rsi init` writes generic Rust/npm defaults, not Python.** Its bundled `DEFAULT_CONFIG` (`cli.py:16`) targets `src/**/*.rs` (cargo) and `packages/web/**` (npm) — it does not match this repo. The committed `.rsi.yaml` is the Python-tailored config; don't `rsi init --force` here.
-- **`--json` has no uniform envelope** — each subcommand emits a different shape (`verify`→`VerificationReport`, `task`→`TaskRecord`, `run`→selection dict, `select`→raw `selection.json`), and errors always go to stderr as plain text regardless of `--json`.
-- **MCP tool naming.** Declared internally with dots (`rsi.create_task`, `rsi.run_verify`, `rsi.select_winner`) but surface as `mcp__rsi-harness__rsi_create_task` / `_run_verify` / `_select_winner`. `.mcp.json` registers the server under both `mcp_servers` and `mcpServers` keys — keep them in sync.
+- **Agent subprocess timeout is hardcoded to 900s** (`config.verify.timeout_sec` applies only to *verification* commands). A timed-out or missing agent CLI is now caught and recorded as a failed candidate (`adapters.py`) rather than crashing the whole run.
+- **`rsi init` writes the Python config** (command `unit` → `python -m unittest discover -s tests`, `selector: score`, `worktree: true`) matching this repo and the README — safe to run here. It is atomic: it refuses to write anything if either target exists without `--force`.
+- **Malformed config fails loudly.** When PyYAML is installed, an invalid `.rsi.yaml`, a `verify.commands` entry missing `name`/`run`, or a non-integer numeric field raises `ConfigError` (no silent fallback to the minimal parser). The minimal parser is only used when PyYAML is absent.
+- **`--json` error envelope.** Success shapes still differ per subcommand (`verify`→`VerificationReport`, `task`→`TaskRecord`, `run`→selection dict, `select`→raw `selection.json`), but any error now prints `{"ok": false, "error": {...}}` to stdout under `--json` (plain stderr otherwise) instead of a traceback.
+- **Hook event labels are correct per event** (`SessionStart`/`UserPromptSubmit`/`PostToolUse` via `hookSpecificOutput`; `Stop` via top-level `systemMessage`).
+- **MCP tool naming.** Declared internally with dots (`rsi.create_task`, `rsi.run_verify`, `rsi.select_winner`) but surface as `mcp__rsi-harness__rsi_create_task` / `_run_verify` / `_select_winner`. `.mcp.json` registers the server under both `mcp_servers` and `mcpServers` keys — keep them in sync. `rsi.select_winner` validates `task_id` (rejects path traversal); a malformed stdin line yields a `-32700` parse error instead of crashing the loop.
 
 ## Working in this repo
 

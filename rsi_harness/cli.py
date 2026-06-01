@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import HarnessConfig, load_config
+from .config import load_config
 from .hooks import run_hook
 from .orchestrator import Orchestrator, changed_commands_from_config, commands_from_config, load_experts
 from .state import HarnessState
@@ -17,17 +17,17 @@ DEFAULT_CONFIG = """verify:
   timeout_sec: 180
   memory_mb: 4096
   commands:
-    - name: tests
+    - name: unit
       run: python -m unittest discover -s tests
   changed_file_rules:
-    "src/**/*.rs": ["cargo test", "cargo clippy -- -D warnings"]
-    "packages/web/**": ["npm test", "npm run typecheck"]
+    "rsi_harness/**/*.py": ["python -m unittest discover -s tests"]
+    "tests/**/*.py": ["python -m unittest discover -s tests"]
 
 search:
   experts: 3
   rounds: 2
-  worktree: false
-  selector: behavioral_vote
+  worktree: true
+  selector: score
   feedback_budget_chars: 12000
   experts_file: experts.yaml
 """
@@ -52,6 +52,13 @@ DEFAULT_EXPERTS = """experts:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        return _dispatch(args)
+    except Exception as exc:  # surface failures as structured output, not a traceback
+        return _report_error(args, exc)
+
+
+def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "init":
         return cmd_init(args)
     if args.command == "verify":
@@ -64,7 +71,18 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_select(args)
     if args.command == "hook":
         return run_hook(args.event)
-    parser.print_help()
+    build_parser().print_help()
+    return 2
+
+
+def _report_error(args: argparse.Namespace, exc: Exception) -> int:
+    message = str(exc) or exc.__class__.__name__
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": False, "error": {"type": type(exc).__name__, "message": message}}, indent=2))
+    else:
+        print(f"error: {message}", file=sys.stderr)
+    # Exit 2 marks an internal/usage error, distinct from a clean "verification did
+    # not pass" (exit 1), so callers gating on the exit code can tell them apart.
     return 2
 
 
@@ -103,10 +121,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
-    for path, content in [(Path(".rsi.yaml"), DEFAULT_CONFIG), (Path("experts.yaml"), DEFAULT_EXPERTS)]:
-        if path.exists() and not args.force:
-            print(f"{path} exists; use --force to overwrite", file=sys.stderr)
+    targets = [(Path(".rsi.yaml"), DEFAULT_CONFIG), (Path("experts.yaml"), DEFAULT_EXPERTS)]
+    if not args.force:
+        existing = [str(path) for path, _ in targets if path.exists()]
+        if existing:
+            print(f"{', '.join(existing)} already exist; use --force to overwrite", file=sys.stderr)
             return 1
+    for path, content in targets:
         path.write_text(content, encoding="utf-8")
         print(f"wrote {path}")
     return 0
@@ -136,7 +157,7 @@ def cmd_task(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     config = load_config(args.config)
-    rounds = args.rounds or config.search.rounds
+    rounds = args.rounds if args.rounds is not None else config.search.rounds
     experts_path = Path(args.experts or config.search.experts_file)
     experts = load_experts(experts_path, fallback_count=config.search.experts)
     task_spec = _read_task_arg(args.task)
@@ -145,8 +166,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(json.dumps(selection, indent=2))
     else:
         print(f"task={selection['task_id']}")
-        print(f"winner={selection['winner']['candidate_id']}")
-    return 0
+        winner = selection.get("winner")
+        print(f"winner={winner['candidate_id']}" if winner else "winner=none (no candidates)")
+        print(f"hard_pass={selection.get('hard_pass', False)}")
+    return 0 if selection.get("hard_pass") else 1
 
 
 def cmd_select(args: argparse.Namespace) -> int:

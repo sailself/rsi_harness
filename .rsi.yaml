@@ -11,8 +11,8 @@ verify:
 search:
   experts: 3
   rounds: 2
-  worktree: false
-  selector: behavioral_vote
+  worktree: true
+  selector: score
   feedback_budget_chars: 12000
   experts_file: experts.yaml
 

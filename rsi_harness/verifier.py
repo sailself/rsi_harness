@@ -57,7 +57,7 @@ class Verifier:
         )
 
     def _run_one(self, command: VerificationCommand, cwd: Path) -> CommandResult:
-        timeout = command.timeout_sec or self.timeout_sec
+        timeout = self.timeout_sec if command.timeout_sec is None else command.timeout_sec
         started = time.monotonic()
         try:
             completed = subprocess.run(

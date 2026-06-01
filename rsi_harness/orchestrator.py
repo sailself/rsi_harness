@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import shutil
 import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
 from .adapters import DriverSpec, build_driver
 from .config import HarnessConfig, _load_structured_data
@@ -45,10 +49,16 @@ def load_experts(path: Path, fallback_count: int = 1) -> list[ExpertSpec]:
 
 
 class Orchestrator:
-    def __init__(self, config: HarnessConfig, state: HarnessState | None = None) -> None:
+    def __init__(
+        self,
+        config: HarnessConfig,
+        state: HarnessState | None = None,
+        driver_factory: Callable[[DriverSpec], Any] = build_driver,
+    ) -> None:
         self.config = config
         self.state = state or HarnessState()
         self.verifier = Verifier(timeout_sec=config.verify.timeout_sec)
+        self.driver_factory = driver_factory
 
     def run(
         self,
@@ -64,20 +74,24 @@ class Orchestrator:
         for round_index in range(1, rounds + 1):
             for expert in experts:
                 prompt = build_candidate_prompt(task_spec, expert.prompt_variant, feedback)
-                candidate_output = self._run_expert(expert, prompt, cwd, dry_run)
-                patch_text = capture_git_diff(cwd) or candidate_output["stdout"]
-                candidate = self.state.create_candidate(
-                    task.task_id,
-                    expert_id=expert.expert_id,
-                    round_index=round_index,
-                    driver=expert.driver,
-                    patch_text=patch_text,
-                )
-                candidate_dir = Path(candidate.metadata_path).parent
-                (candidate_dir / "prompt.md").write_text(prompt, encoding="utf-8")
-                (candidate_dir / "agent.json").write_text(json.dumps(candidate_output, indent=2), encoding="utf-8")
+                # Each candidate runs (and is verified) in its own isolated workspace
+                # rooted at the task baseline, so its captured patch and verification
+                # reflect only this candidate, not the cumulative state of prior ones.
+                with self._candidate_workspace(cwd) as work_cwd:
+                    candidate_output = self._run_expert(expert, prompt, work_cwd, dry_run)
+                    patch_text = capture_git_diff(work_cwd) or candidate_output["stdout"]
+                    candidate = self.state.create_candidate(
+                        task.task_id,
+                        expert_id=expert.expert_id,
+                        round_index=round_index,
+                        driver=expert.driver,
+                        patch_text=patch_text,
+                    )
+                    candidate_dir = Path(candidate.metadata_path).parent
+                    (candidate_dir / "prompt.md").write_text(prompt, encoding="utf-8")
+                    (candidate_dir / "agent.json").write_text(json.dumps(candidate_output, indent=2), encoding="utf-8")
 
-                report = self.verifier.run(commands_from_config(self.config), cwd)
+                    report = self.verifier.run(commands_from_config(self.config), work_cwd)
                 report_doc = report.to_dict()
                 report_doc["argv"] = candidate_output.get("argv")
                 report_doc["agent_exit_code"] = candidate_output.get("exit_code")
@@ -85,8 +99,13 @@ class Orchestrator:
                 scores.append(score_from_report(candidate.candidate_id, report, patch_text))
                 feedback = compact_feedback(report, self.config.search.feedback_budget_chars)
 
-        winner = select_winner(scores)
-        selection = {"task_id": task.task_id, "winner": winner.__dict__, "candidate_count": len(scores)}
+        winner = select_winner(scores) if scores else None
+        selection = {
+            "task_id": task.task_id,
+            "winner": winner.__dict__ if winner else None,
+            "candidate_count": len(scores),
+            "hard_pass": any(score.hard_pass for score in scores),
+        }
         self.state.write_task_artifact(task.task_id, "selection.json", json.dumps(selection, indent=2))
         return selection
 
@@ -96,12 +115,43 @@ class Orchestrator:
             command=expert.command,
             extra_args=expert.extra_args,
         )
-        driver = build_driver(spec)
+        driver = self.driver_factory(spec)
         argv = driver.build_argv(prompt)
         if dry_run:
             return {"argv": argv, "exit_code": 0, "stdout": "", "stderr": "", "dry_run": True}
         run = driver.run(prompt, cwd)
         return {"argv": run.argv, "exit_code": run.exit_code, "stdout": run.stdout, "stderr": run.stderr}
+
+    @contextmanager
+    def _candidate_workspace(self, cwd: Path) -> Iterator[Path]:
+        """Yield a working directory for one candidate.
+
+        When search.worktree is enabled and cwd is a git repo with a commit, the
+        candidate gets a throwaway detached git worktree rooted at the current HEAD,
+        so its file changes (and the captured diff) are isolated from other
+        candidates and never touch the caller's working tree. Otherwise the caller's
+        cwd is used directly (no isolation).
+        """
+        baseline = _git_head(cwd) if self.config.search.worktree else None
+        if baseline is None:
+            yield cwd
+            return
+        parent = Path(tempfile.mkdtemp(prefix="rsi-wt-"))
+        work = parent / "wt"
+        if not _git_worktree_add(cwd, work, baseline):
+            shutil.rmtree(parent, ignore_errors=True)
+            print(
+                f"rsi: warning: worktree isolation was requested but `git worktree add` failed; "
+                f"running this candidate in {cwd} (the working tree may be modified)",
+                file=sys.stderr,
+            )
+            yield cwd
+            return
+        try:
+            yield work
+        finally:
+            _git_worktree_remove(cwd, work)
+            shutil.rmtree(parent, ignore_errors=True)
 
 
 def commands_from_config(config: HarnessConfig) -> list[VerificationCommand]:
@@ -142,6 +192,54 @@ def git_changed_files(cwd: Path) -> list[str]:
     if completed.returncode != 0:
         return []
     return [line.strip().replace("\\", "/") for line in completed.stdout.splitlines() if line.strip()]
+
+
+def _git_head(cwd: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip() or None
+
+
+def _git_worktree_add(cwd: Path, work: Path, baseline: str) -> bool:
+    try:
+        completed = subprocess.run(
+            ["git", "worktree", "add", "--detach", str(work), baseline],
+            cwd=str(cwd),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def _git_worktree_remove(cwd: Path, work: Path) -> None:
+    try:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(work)],
+            cwd=str(cwd),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
 
 
 def capture_git_diff(cwd: Path) -> str:

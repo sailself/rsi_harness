@@ -144,8 +144,8 @@ verify:
 search:
   experts: 3
   rounds: 2
-  worktree: false
-  selector: behavioral_vote
+  worktree: true
+  selector: score
   feedback_budget_chars: 12000
   experts_file: experts.yaml
 ```
@@ -236,9 +236,22 @@ rsi run --task "Fix flaky timeout test" --dry-run --json
 ```
 
 For each expert and round, the orchestrator builds a candidate prompt, invokes
-the driver, captures the current Git diff as the candidate patch when available,
-runs verification, writes a report, and carries compact failure output into the
-next prompt.
+the driver, captures the Git diff as the candidate patch when available, runs
+verification, writes a report, and carries compact failure output into the next
+prompt.
+
+When `search.worktree` is true (the default) and the project is a Git repository
+with at least one commit, each candidate runs and is verified inside a throwaway
+detached Git worktree rooted at the current `HEAD`. This keeps every candidate's
+captured patch and verification independent of the others and leaves your real
+working tree untouched. Because each worktree starts from the committed `HEAD`,
+candidates do not see uncommitted or untracked changes, so commit work you want
+them to build on first. With `worktree: false` (or outside Git), candidates share
+the current directory and their diffs accumulate, so run on a clean branch.
+
+`rsi run` exits non-zero unless the selected winner passed hard verification, and
+the JSON selection carries a top-level `hard_pass` flag plus `winner` (which is
+`null` when no candidates were produced), so automation can gate on the result.
 
 ### `rsi select`
 
@@ -374,7 +387,9 @@ rsi verify --changed --json
 
 This repository is an installable scaffold, not Poetiq's proprietary learned
 meta-system. It does not yet learn new verifier strategies from historical task
-data. Candidate search runs in the current worktree, so use a clean branch or
+data. Candidate search isolates each candidate in its own Git worktree when
+`search.worktree` is enabled; with isolation disabled (or outside a Git
+repository) candidates run in the current worktree, so use a clean branch or
 inspect the captured patches carefully when running real external agents.
 
 `verify.memory_mb` is currently configuration metadata; verification enforces
