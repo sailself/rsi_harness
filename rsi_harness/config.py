@@ -37,6 +37,7 @@ class SearchConfig:
     experts_file: str = "experts.yaml"
     agent_timeout_sec: int = 900
     changed_only: bool = False
+    use_corpus: bool = False
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,7 @@ def config_from_dict(data: dict[str, Any]) -> HarnessConfig:
         experts_file=str(search_data.get("experts_file", "experts.yaml")),
         agent_timeout_sec=_required_int(search_data.get("agent_timeout_sec", 900), key="search.agent_timeout_sec"),
         changed_only=bool(search_data.get("changed_only", False)),
+        use_corpus=bool(search_data.get("use_corpus", False)),
     )
     return HarnessConfig(verify=verify, search=search)
 
