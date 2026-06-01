@@ -21,6 +21,9 @@ python -m unittest discover -s tests -p test_rsi_harness.py -k <method_or_class_
 # Run the harness's own verifier against this repo (driven by ./.rsi.yaml -> runs the test suite)
 python -m rsi_harness.cli verify --json
 
+# Summarize cross-task learnings from the .rsi/tasks corpus (per-expert win rates, recurring failures)
+python -m rsi_harness.cli learn --json
+
 # Run the CLI without installing (module entry point; what bin/rsi.cmd uses on Windows)
 python -m rsi_harness.cli <subcommand> ...
 
@@ -117,4 +120,4 @@ The plugin manifests (`.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`)
 
 Per `AGENTS.md` / `skills/rsi-coding/SKILL.md`, the intended workflow for non-trivial tasks: write a measurable spec first, prefer checks that can fail before implementation, run `rsi verify --changed --json` after material edits, reach for `rsi run --task <file-or-text> --experts experts.yaml --rounds <N>` on hard bugs/refactors/perf work, and report exact commands plus selection evidence.
 
-This repo is an installable scaffold, not a learned meta-system: it does not yet learn verifier strategies from history, and `verify.memory_mb` is config metadata only (timeouts are enforced; OS memory limits are not).
+This repo is an installable scaffold. It now closes a **practical cross-task loop** (`search.use_corpus`): `corpus.py`/`rsi learn` read the `.rsi/tasks` corpus, and a `use_corpus` run orders experts by past win-rate and seeds prompts with recurring-failure hints. It does **not** yet auto-optimize its own verifier strategies (the article's full meta-system), and `verify.memory_mb` is config metadata only (timeouts are enforced; OS memory limits are not).

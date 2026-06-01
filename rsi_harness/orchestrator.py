@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterator
 
 from .adapters import DriverSpec, build_driver
 from .config import HarnessConfig, _load_structured_data
+from .corpus import CorpusStats, load_corpus_stats
 from .selector import CandidateScore, select_winner
 from .state import HarnessState
 from .verifier import VerificationCommand, VerificationReport, Verifier
@@ -70,6 +71,16 @@ class Orchestrator:
         dry_run: bool = False,
         on_progress: Callable[[int, int, str], None] | None = None,
     ) -> dict[str, Any]:
+        # Cross-task recursion (opt-in): read prior outcomes BEFORE creating this
+        # task, then order experts by historical win-rate and seed prompts with
+        # recurring-failure hints. Read first so the not-yet-populated current task
+        # does not skew the stats.
+        corpus_hints = ""
+        if self.config.search.use_corpus:
+            stats = load_corpus_stats(self.state)
+            experts = _order_experts_by_history(experts, stats)
+            corpus_hints = _corpus_hints(stats)
+
         task = self.state.create_task(task_spec, {"rounds": rounds, "experts": [expert.expert_id for expert in experts]})
         feedback_by_expert: dict[str, str] = {}
         scores: list[CandidateScore] = []
@@ -79,7 +90,7 @@ class Orchestrator:
                     on_progress(round_index, rounds, expert.expert_id)
                 # Each expert repairs its OWN prior-round failure, not a sibling's last result.
                 feedback = feedback_by_expert.get(expert.expert_id, "")
-                prompt = build_candidate_prompt(task_spec, expert.prompt_variant, feedback)
+                prompt = build_candidate_prompt(task_spec, expert.prompt_variant, feedback, corpus_hints)
                 # Each candidate runs (and is verified) in its own isolated workspace
                 # rooted at the task baseline, so its captured patch and verification
                 # reflect only this candidate, not the cumulative state of prior ones.
@@ -164,6 +175,20 @@ class Orchestrator:
         finally:
             _git_worktree_remove(cwd, work)
             shutil.rmtree(parent, ignore_errors=True)
+
+
+def _order_experts_by_history(experts: list[ExpertSpec], stats: CorpusStats) -> list[ExpertSpec]:
+    # Stable sort: experts with higher historical win-rate run first; ties and
+    # experts with no history keep their given order.
+    return sorted(experts, key=lambda expert: -stats.expert_win_rate(expert.expert_id))
+
+
+def _corpus_hints(stats: CorpusStats) -> str:
+    top = stats.top_failing_commands(3)
+    if not top:
+        return ""
+    items = ", ".join(f"{name} (failed {count}x)" for name, count in top)
+    return f"Historically, these checks have failed most often: {items}. Address them proactively."
 
 
 def commands_from_config(config: HarnessConfig) -> list[VerificationCommand]:
@@ -299,7 +324,9 @@ PROMPT_VARIANTS = {
 }
 
 
-def build_candidate_prompt(task_spec: str, prompt_variant: str, feedback: str = "") -> str:
+def build_candidate_prompt(
+    task_spec: str, prompt_variant: str, feedback: str = "", corpus_hints: str = ""
+) -> str:
     parts = [
         "# RSI candidate task",
         "",
@@ -310,6 +337,8 @@ def build_candidate_prompt(task_spec: str, prompt_variant: str, feedback: str = 
         # through as a label so custom variants still reach the agent.
         PROMPT_VARIANTS.get(prompt_variant, f"Prompt variant: {prompt_variant}"),
     ]
+    if corpus_hints:
+        parts.extend(["", "## Lessons from prior runs", corpus_hints])
     if feedback:
         parts.extend(["", "## Previous executable feedback", feedback])
     return "\n".join(parts)
